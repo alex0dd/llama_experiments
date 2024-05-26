@@ -35,10 +35,26 @@ def build_offsetted_getter(data, base_offset):
         return data[begin_offset: end_offset]
     return get_tensor
 
+def load_tensor_from_memory(file_name, begin_pos, n_of_bytes):
+    """
+    Returns n_of_bytes raw bytes from a binary file, starting from begin_pos position.
+    """
+    raw_data = None
+    with open(file_name, "rb") as file:
+        file.seek(begin_pos)
+        raw_data = file.read(n_of_bytes)
+    return raw_data
+
+def deallocate_tensor(tensor):
+    del tensor
+
 class SafeTensorParser:
 
-    def __init__(self, data_raw):
-        self._tensor_metadata, self._metadata, self._tensor_memory = self._parse_structure(data_raw)
+    #def __init__(self, data_raw):
+        #self._tensor_metadata, self._metadata, self._tensor_memory = self._parse_structure(data_raw)
+    def __init__(self, file_path):
+        self._file_path = file_path
+        self._tensor_metadata, self._metadata, self._data_base_offset = self._parse_structure(self._file_path)
 
     @property
     def tensor_names(self):
@@ -47,21 +63,26 @@ class SafeTensorParser:
     def shape(self, name):
         return self._tensor_metadata[name]["shape"]
 
-    def _parse_structure(self, data):
+    def _parse_structure(self, file_path):
         """
+        Inputs:
+            - file_path: path of safetensors file
+        
         File structure
         8 bytes: N=u64 int containing header size
         N bytes: JSON utf-8 string representing header
         Rest of file: data
         """
-        header_base_offset = 8
-        header_size = bytes_to_uint(data[0:header_base_offset]) # 0-7
-        data_base_offset = header_base_offset+header_size
-        header = data[header_base_offset:data_base_offset] # 8 - 8 + N
-        header = json.loads(header)
-        tensor_metadata, metadata = self._parse_header(header)
-        tensor_memory = data[data_base_offset:] # until end of file
-        return tensor_metadata, metadata, tensor_memory
+        with open(file_path, "rb") as file:
+            header_size_field_length = 8
+            header_size = file.read(header_size_field_length) # header size
+            header_size = bytes_to_uint(header_size) # 0-7
+            data_base_offset = header_size_field_length + header_size
+            header = file.read(header_size) # 8 - 8 + N (read header_size bytes)
+            header = json.loads(header)
+            tensor_metadata, metadata = self._parse_header(header)
+
+            return tensor_metadata, metadata, data_base_offset
 
     def _parse_header(self, header):
         """
@@ -75,9 +96,14 @@ class SafeTensorParser:
         return tensor_metadata, metadata
 
     def _get_tensor_data_raw(self, name):
-        begin_offset = self._tensor_metadata[name]["data_offsets"][0]
-        end_offset = self._tensor_metadata[name]["data_offsets"][1]
-        return self._tensor_memory[begin_offset: end_offset]
+        # Loads the tensor from secondary memory, only when requested
+        start_tensor_offset = self._tensor_metadata[name]["data_offsets"][0]
+        end_tensor_offset = self._tensor_metadata[name]["data_offsets"][1]
+        begin_pos = start_tensor_offset + self._data_base_offset
+        n_of_bytes = end_tensor_offset - start_tensor_offset
+        # read the data
+        data_raw = load_tensor_from_memory(self._file_path, begin_pos, n_of_bytes)
+        return data_raw
     
     def get_tensor(self, name):
         shape = self._tensor_metadata[name]["shape"]
@@ -86,13 +112,7 @@ class SafeTensorParser:
         # TODO: add parsing cache, so that if a tensor was parsed, it can be offloaded to HDD or in RAM
         return current_tensor
 
-
-# Opening the binary file in binary mode as rb(read binary)
-f = open("./Meta-Llama-3-8B/model-00001-of-00004.safetensors", mode="rb")
-# Reading file data with read() method
-data = f.read()
-f.close()
-
-tensor_parser = SafeTensorParser(data)
+tensor_parser = SafeTensorParser("./Meta-Llama-3-8B/model-00001-of-00004.safetensors")
 print(tensor_parser.tensor_names)
 tensor = tensor_parser.get_tensor("model.layers.8.post_attention_layernorm.weight")
+tensor = tensor_parser.get_tensor("model.layers.8.self_attn.v_proj.weight")
