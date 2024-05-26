@@ -1,5 +1,3 @@
-from safetensors.numpy import safe_open
-
 import json
 import os
 import sys
