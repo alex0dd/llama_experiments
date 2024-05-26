@@ -37,10 +37,17 @@ def build_offsetted_getter(data, base_offset):
         return data[begin_offset: end_offset]
     return get_tensor
 
-class TensorParser:
+class SafeTensorParser:
 
     def __init__(self, data_raw):
         self._tensor_metadata, self._metadata, self._tensor_memory = self._parse_structure(data_raw)
+
+    @property
+    def tensor_names(self):
+        return list(self._tensor_metadata.keys())
+    
+    def shape(self, name):
+        return self._tensor_metadata[name]["shape"]
 
     def _parse_structure(self, data):
         """
@@ -88,55 +95,6 @@ f = open("./Meta-Llama-3-8B/model-00001-of-00004.safetensors", mode="rb")
 data = f.read()
 f.close()
 
-#def parse_file(data):
-"""
-File structure
-8 bytes: N=u64 int containing header size
-N bytes: JSON utf-8 string representing header
-Rest of file: data
-"""
-header_base_offset = 8
-header_size = bytes_to_uint(data[0:header_base_offset]) # 0-7
-data_base_offset = header_base_offset+header_size
-header = data[header_base_offset:data_base_offset] # 8 - 8 + N
-header = json.loads(header)
-
-tensor_metadata = {}
-
-for key, value in header.items():
-    if key == "__metadata__": continue
-    tensor_metadata[key] = value
-    print(key)
-
-get_tensor = build_offsetted_getter(data, base_offset=data_base_offset)
-
-tensor_name = "model.layers.8.self_attn.k_proj.weight"
-current_tensor_metadata = tensor_metadata[tensor_name]
-shape = current_tensor_metadata["shape"]
-current_tensor_raw = get_tensor(current_tensor_metadata)
-current_tensor = parse_bf16_tensor(current_tensor_raw, shape)
-
-#struct.unpack("<e", tensor[:2])
-
-raise
-
-def safetensors_metadata_parser(file_path):
-    header_size = 8
-    meta_data = {}
-    if os.stat(file_path).st_size > header_size:
-        with open(file_path, "rb") as f:
-            b8 = f.read(header_size)
-            if len(b8) == header_size:
-                header_len = int.from_bytes(b8, 'little', signed=False)
-                headers = f.read(header_len)
-                if len(headers) == header_len:
-                    meta_data = sorted(json.loads(headers.decode("utf-8")).get("__metadata__", meta_data).items())
-    return meta_data
-
-file_path = "./Meta-Llama-3-8B/model-00001-of-00004.safetensors"
-
-meta_data = safetensors_metadata_parser(file_path)
-#result = {}
-#with safe_open(file_path, framework="np") as f:
-#    for k in f.keys():
-#        result[k] = f.get_tensor(k)
+tensor_parser = SafeTensorParser(data)
+print(tensor_parser.tensor_names)
+tensor = tensor_parser.get_tensor("model.layers.8.post_attention_layernorm.weight")
