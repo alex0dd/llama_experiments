@@ -1,0 +1,1 @@
+from .safetensors_parser import SafeTensorsParser
