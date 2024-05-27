@@ -1,6 +1,7 @@
 import json
 
-from utils import bytes_to_uint, load_tensor_from_memory, parse_bf16_tensor
+from utils import bytes_to_uint, load_tensor_from_memory
+from utils import parse_bf16_tensor_v3 as parse_bf16_tensor
 
 class SafeTensorsParser:
 
@@ -11,6 +12,10 @@ class SafeTensorsParser:
     @property
     def tensor_names(self):
         return list(self._tensor_metadata.keys())
+    
+    @property
+    def tensor_shapes(self):
+        return [(name, self._tensor_metadata[name]["shape"]) for name in self._tensor_metadata.keys()]
     
     def shape(self, name):
         return self._tensor_metadata[name]["shape"]
@@ -58,6 +63,7 @@ class SafeTensorsParser:
         return data_raw
     
     def get_tensor(self, name):
+        assert name in self.tensor_names, f"Tensor {name} is not in list of tensor names loaded from {self._file_path}"
         shape = self._tensor_metadata[name]["shape"]
         current_tensor_raw = self._get_tensor_data_raw(name)
         current_tensor = parse_bf16_tensor(current_tensor_raw, shape)
