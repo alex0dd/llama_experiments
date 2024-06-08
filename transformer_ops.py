@@ -132,9 +132,17 @@ class TransformerBlock:
     def __init__(self):
         pass
 
-class MLP:
-    def __init__(self):
+class FFN():
+    def __init__(
+        self,
+    ):
         pass
+
+    def forward(self, x, weights):
+        output = torch.nn.functional.linear(x, weights["mlp.gate_proj.weight"])
+        output = torch.nn.functional.silu(output) * torch.nn.functional.linear(x, weights["mlp.up_proj.weight"])
+        output = torch.nn.functional.linear(output, weights["mlp.down_proj.weight"])
+        return output
 
 class RMSNorm:
     """
