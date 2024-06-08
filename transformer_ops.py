@@ -22,6 +22,40 @@ from typing import Optional, Tuple
 [14336, 4096]
 """
 
+def hf_undo_permute(w, n_heads, dim1, dim2):
+    return w.view(n_heads, 2, dim1 // n_heads // 2, dim2).transpose(1, 2).reshape(dim1, dim2)
+
+def remap_weights_if_needed(weights, param_name, config):
+    """
+    Important: HF checkpoint permutes the original weights for Q, K weight tensors
+    https://github.com/huggingface/transformers/blob/25245ec26dc29bcf6102e1b4ddd0dfd02e720cf5/src/transformers/models/llama/convert_llama_weights_to_hf.py#L174-L182
+    This function will take a block of attention weights and permute only the ones that need to be permuted
+    """
+    if "self_attn.q_proj.weight" in param_name:
+        weights = hf_undo_permute(
+            weights,
+            n_heads=config["num_attention_heads"],
+            dim1=config["hidden_size"],
+            dim2=config["hidden_size"],
+        )
+    elif "self_attn.k_proj.weight" in param_name:
+        # NOTE: for llama 3 70B this will need to be fixed further, as num_shards will be different
+        num_shards = 1
+        num_key_value_heads = config["num_key_value_heads"]
+        n_heads = config["num_attention_heads"]
+        n_heads_per_shard = n_heads // num_shards
+        num_local_key_value_heads = n_heads_per_shard // num_key_value_heads
+        
+        weights = hf_undo_permute(
+            weights,
+            n_heads=config["num_key_value_heads"],
+            dim1=config["hidden_size"] // num_local_key_value_heads,
+            dim2=config["hidden_size"],
+        )
+    return weights
+        
+    
+
 def embedding_matrix(inputs, weights):
     # https://pytorch.org/docs/stable/generated/torch.nn.functional.embedding.html
     return torch.nn.functional.embedding(inputs, weights)
@@ -128,12 +162,13 @@ class RMSNorm:
         return output * weights
 
 class Attention:
-    def __init__(self, config):
+    def __init__(self, config, max_seq_len=2048):
         self.config = config
         self.n_rep = config["num_attention_heads"] // config["num_key_value_heads"]
         self.n_kv_heads = config["num_key_value_heads"]
         self.n_heads = config["num_attention_heads"]
         self.head_dim = config["hidden_size"] // config["num_attention_heads"]
+        self.max_seq_len = max_seq_len
         """
         KV cache, memory occupation: MAX_BS*MAX_SEQ_LEN*N_KV_HEADS*HEAD_DIM*2 (2 because we have K and V)
 
@@ -146,11 +181,10 @@ class Attention:
         Bytes per layer = 4194304 * 4 (assuming float) = 16777216 bytes (16MB per layer)
         Bytes per model = 16777216 * NUM_LAYERS = 16777216 * 32 = 536870912 (512MB per model)
         """
-        MAX_BS = 1
-        MAX_SEQ_LEN = 2048
+        MAX_BS = 4
         # TODO: move this outside of the class, so we can store it when this layer gets deleted
-        self.cache_k = torch.zeros((MAX_BS, MAX_SEQ_LEN, self.n_kv_heads, self.head_dim), dtype=self.config["torch_dtype"])
-        self.cache_v = torch.zeros((MAX_BS, MAX_SEQ_LEN, self.n_kv_heads, self.head_dim), dtype=self.config["torch_dtype"])
+        self.cache_k = torch.zeros((MAX_BS, self.max_seq_len, self.n_kv_heads, self.head_dim), dtype=self.config["torch_dtype"])
+        self.cache_v = torch.zeros((MAX_BS, self.max_seq_len, self.n_kv_heads, self.head_dim), dtype=self.config["torch_dtype"])
 
     def get_cache(self):
         return (self.cache_k, self.cache_v)
