@@ -39,6 +39,7 @@ def parse_bf16_tensor_v2(tensor, shape):
     return parsed_vals
 
 def parse_bf16_tensor_v3(tensor, shape):
+    tensor = bytearray(tensor)
     parsed_vals = torch.frombuffer(tensor, dtype=torch.bfloat16).reshape(shape)
     return parsed_vals
 
