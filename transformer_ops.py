@@ -117,27 +117,29 @@ def precompute_rope_constants(dim: int, end: int, theta: float = 10000.0):
 
 # TODO: rewrite majority of layers using functional style, since we want to avoid holding internal state. This will make code more elegant
 class Transformer:
-    def __init__(self, config, parser):
+    def __init__(self, config, parser, device="cpu"):
+        self.device=device
         self.freqs_rope = precompute_rope_constants(
             config["hidden_size"] // config["num_attention_heads"],
             config["max_position_embeddings"] * 2,
             config["rope_theta"],
-        )
+        ).to(self.device)
         self.config = config
         self.num_layers = config["num_hidden_layers"]
         self.parser = parser
-        self.caches_memory = self._build_kv_caches(config)
+        self.caches_memory = self._build_kv_caches(config, device=self.device)
         self.transformer_block = TransformerBlock(config)
 
-        self.embedding_weights = parser.get_tensor('model.embed_tokens.weight')
+        self.embedding_weights = parser.get_tensor('model.embed_tokens.weight').to(self.device)
         if config["tie_word_embeddings"]:
             self.output_embedding_weights = self.embedding_weights
         else:
             self.output_embedding_weights = parser.get_tensor('lm_head.weight')
+        self.output_embedding_weights = self.output_embedding_weights.to(self.device)
         self.output_norm = RMSNorm()
-        self.output_norm_weights = parser.get_tensor('model.norm.weight')
+        self.output_norm_weights = parser.get_tensor('model.norm.weight').to(self.device)
 
-    def _build_kv_caches(self, config, max_seq_len=2048, max_bs=4):
+    def _build_kv_caches(self, config, device, max_seq_len=2048, max_bs=4):
         """
         KV cache, memory occupation: MAX_BS*MAX_SEQ_LEN*N_KV_HEADS*HEAD_DIM*2 (2 because we have K and V)
 
@@ -155,8 +157,8 @@ class Transformer:
         head_dim = config["hidden_size"] // config["num_attention_heads"]
         for layer_idx in range(config["num_hidden_layers"]):
             caches_memory[layer_idx] = {}
-            caches_memory[layer_idx]["k"] = torch.zeros((max_bs, max_seq_len, n_kv_heads, head_dim), dtype=config["torch_dtype"])
-            caches_memory[layer_idx]["v"] = torch.zeros((max_bs, max_seq_len, n_kv_heads, head_dim), dtype=config["torch_dtype"])
+            caches_memory[layer_idx]["k"] = torch.zeros((max_bs, max_seq_len, n_kv_heads, head_dim), dtype=config["torch_dtype"], device=device)
+            caches_memory[layer_idx]["v"] = torch.zeros((max_bs, max_seq_len, n_kv_heads, head_dim), dtype=config["torch_dtype"], device=device)
         return caches_memory
 
     def _build_mask(self, seq_len, start_pos, device, dtype):
@@ -173,7 +175,7 @@ class Transformer:
             ).to(dtype)
         return mask
 
-    def _load_weights_for_block(self, config, layer_idx):
+    def _load_weights_for_block(self, config, layer_idx, device):
         # Loads all weights for an attention module, renaming and remapping weights if needed
         weights = {}
         for letter in ['q', 'k', 'v', 'o']:
@@ -187,6 +189,8 @@ class Transformer:
         weights['mlp.up_proj.weight'] = self.parser.get_tensor(f'model.layers.{layer_idx}.mlp.up_proj.weight')
         weights['input_layernorm.weight'] = self.parser.get_tensor(f'model.layers.{layer_idx}.input_layernorm.weight')
         weights['post_attention_layernorm.weight'] = self.parser.get_tensor(f'model.layers.{layer_idx}.post_attention_layernorm.weight')
+        for key in weights.keys():
+            weights[key] = weights[key].to(device)
         return weights
 
     def forward(self, tokens: torch.Tensor, start_pos: int):
@@ -199,12 +203,12 @@ class Transformer:
         for layer_idx in range(self.num_layers):
             cache_k = self.caches_memory[layer_idx]["k"]
             cache_v = self.caches_memory[layer_idx]["v"]
-            block_weights = self._load_weights_for_block(self.config, layer_idx)
+            block_weights = self._load_weights_for_block(self.config, layer_idx, device=tokens.device)
             h = self.transformer_block.forward(h, block_weights, cache_k, cache_v, start_pos, freqs_rope, mask)
             # delete weights after inference on that block
             del block_weights
         h = self.output_norm.forward(h, self.output_norm_weights)
-        output = embedding_matrix(tokens, self.output_embedding_weights).float()
+        output = torch.nn.functional.linear(h, self.output_embedding_weights).float()
         return output
 
 class TransformerBlock:
