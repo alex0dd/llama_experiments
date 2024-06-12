@@ -1,6 +1,6 @@
 import torch
 import math
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 """
 'model.layers.{i}.input_layernorm.weight',
@@ -115,22 +115,111 @@ def precompute_rope_constants(dim: int, end: int, theta: float = 10000.0):
     freqs_rope = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_rope
 
+# TODO: rewrite majority of layers using functional style, since we want to avoid holding internal state. This will make code more elegant
 class Transformer:
-    def __init__(self, config):
+    def __init__(self, config, parser):
         self.freqs_rope = precompute_rope_constants(
             config["hidden_size"] // config["num_attention_heads"],
             config["max_position_embeddings"] * 2,
             config["rope_theta"],
         )
+        self.config = config
+        self.num_layers = config["num_hidden_layers"]
+        self.parser = parser
+        self.caches_memory = self._build_kv_caches(config)
+        self.transformer_block = TransformerBlock(config)
+
+        self.embedding_weights = parser.get_tensor('model.embed_tokens.weight')
+        if config["tie_word_embeddings"]:
+            self.output_embedding_weights = self.embedding_weights
+        else:
+            self.output_embedding_weights = parser.get_tensor('lm_head.weight')
+        self.output_norm = RMSNorm()
+        self.output_norm_weights = parser.get_tensor('model.norm.weight')
+
+    def _build_kv_caches(self, config, max_seq_len=2048, max_bs=4):
+        """
+        KV cache, memory occupation: MAX_BS*MAX_SEQ_LEN*N_KV_HEADS*HEAD_DIM*2 (2 because we have K and V)
+
+        MAX_BS = 1
+        MAX_SEQ_LEN = 2048 (can be up to 8192)
+        N_KV_HEADS = 8
+        HEAD_DIM = dim//n_heads=4096//32=128
+
+        Total per layer = 1 * 2048 * 8 * 128 * 2 = 4194304 entries
+        Bytes per layer = 4194304 * 4 (assuming float) = 16777216 bytes (16MB per layer)
+        Bytes per model = 16777216 * NUM_LAYERS = 16777216 * 32 = 536870912 (512MB per model)
+        """
+        caches_memory = {}
+        n_kv_heads = config["num_key_value_heads"]
+        head_dim = config["hidden_size"] // config["num_attention_heads"]
+        for layer_idx in range(config["num_hidden_layers"]):
+            caches_memory[layer_idx] = {}
+            caches_memory[layer_idx]["k"] = torch.zeros((max_bs, max_seq_len, n_kv_heads, head_dim), dtype=config["torch_dtype"])
+            caches_memory[layer_idx]["v"] = torch.zeros((max_bs, max_seq_len, n_kv_heads, head_dim), dtype=config["torch_dtype"])
+        return caches_memory
+
+    def _build_mask(self, seq_len, start_pos, device, dtype):
+        mask = None
+        if seq_len > 1:
+            mask = torch.full((seq_len, seq_len), float("-inf"), device=device)
+            mask = torch.triu(mask, diagonal=1)
+            # When performing key-value caching, we compute the attention scores
+            # only for the new sequence. Thus, the matrix of scores is of size
+            # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
+            # j > cache_len + i, since row i corresponds to token cache_len + i.
+            mask = torch.hstack(
+                [torch.zeros((seq_len, start_pos), device=device), mask]
+            ).to(dtype)
+        return mask
+
+    def _load_weights_for_block(self, config, layer_idx):
+        # Loads all weights for an attention module, renaming and remapping weights if needed
+        weights = {}
+        for letter in ['q', 'k', 'v', 'o']:
+            orig_key = f'model.layers.{layer_idx}.self_attn.{letter}_proj.weight'
+            new_key = f'self_attn.{letter}_proj.weight'
+            weights[new_key] = remap_weights_if_needed(self.parser.get_tensor(orig_key), param_name=orig_key, config=config)
+
+        # Loads all the remaining (MLP+normalization) weights
+        weights['mlp.down_proj.weight'] = self.parser.get_tensor(f'model.layers.{layer_idx}.mlp.down_proj.weight')
+        weights['mlp.gate_proj.weight'] = self.parser.get_tensor(f'model.layers.{layer_idx}.mlp.gate_proj.weight')
+        weights['mlp.up_proj.weight'] = self.parser.get_tensor(f'model.layers.{layer_idx}.mlp.up_proj.weight')
+        weights['input_layernorm.weight'] = self.parser.get_tensor(f'model.layers.{layer_idx}.input_layernorm.weight')
+        weights['post_attention_layernorm.weight'] = self.parser.get_tensor(f'model.layers.{layer_idx}.post_attention_layernorm.weight')
+        return weights
 
     def forward(self, tokens: torch.Tensor, start_pos: int):
         seq_len = tokens.shape[-1]
-        seq_embeddings = embedding_matrix(tokens, embedding_weights)
-        freqs_cis = self.freqs_rope[start_pos : start_pos + seq_len]
+        seq_embeddings = embedding_matrix(tokens, self.embedding_weights)
+        freqs_rope = self.freqs_rope[start_pos : start_pos + seq_len]
+        mask = self._build_mask(seq_len, start_pos, device=tokens.device, dtype=seq_embeddings.dtype)
+        h = seq_embeddings
+        
+        for layer_idx in range(self.num_layers):
+            cache_k = self.caches_memory[layer_idx]["k"]
+            cache_v = self.caches_memory[layer_idx]["v"]
+            block_weights = self._load_weights_for_block(self.config, layer_idx)
+            h = self.transformer_block.forward(h, block_weights, cache_k, cache_v, start_pos, freqs_rope, mask)
+            # delete weights after inference on that block
+            del block_weights
+        h = self.output_norm.forward(h, self.output_norm_weights)
+        output = embedding_matrix(tokens, self.output_embedding_weights).float()
+        return output
 
 class TransformerBlock:
-    def __init__(self):
-        pass
+    def __init__(self, config):
+        self.attention=Attention(config)
+        self.attention_norm = RMSNorm()
+        self.ffn_norm = RMSNorm()
+        self.ffn = FFN()
+
+    def forward(self, x: torch.Tensor, weights, cache_k, cache_v, start_pos: int, freqs_rope: torch.Tensor, mask: Optional[torch.Tensor]):
+        attended_x = self.attention_norm.forward(x, weights["input_layernorm.weight"])
+        hidden = x + self.attention.forward(attended_x, start_pos, weights, cache_k, cache_v, freqs_rope, mask)
+        attended_hidden = self.ffn_norm.forward(hidden, weights["post_attention_layernorm.weight"])
+        output = hidden + self.ffn.forward(attended_hidden, weights)
+        return output
 
 class FFN():
     def __init__(
@@ -138,7 +227,7 @@ class FFN():
     ):
         pass
 
-    def forward(self, x, weights):
+    def forward(self, x: torch.Tensor, weights: Dict[str, torch.Tensor]):
         output = torch.nn.functional.linear(x, weights["mlp.gate_proj.weight"])
         output = torch.nn.functional.silu(output) * torch.nn.functional.linear(x, weights["mlp.up_proj.weight"])
         output = torch.nn.functional.linear(output, weights["mlp.down_proj.weight"])
@@ -160,7 +249,7 @@ class RMSNorm:
         rms_a = inputs * torch.rsqrt(rms_a + self.eps)
         return rms_a
 
-    def forward(self, inputs: torch.Tensor, weights) -> torch.Tensor:
+    def forward(self, inputs: torch.Tensor, weights: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
         In the original paper inputs = a, weights = g (gain)
         """
@@ -176,7 +265,7 @@ class Attention:
         self.n_kv_heads = config["num_key_value_heads"]
         self.n_heads = config["num_attention_heads"]
         self.head_dim = config["hidden_size"] // config["num_attention_heads"]
-        self.max_seq_len = max_seq_len
+        #self.max_seq_len = max_seq_len
         """
         KV cache, memory occupation: MAX_BS*MAX_SEQ_LEN*N_KV_HEADS*HEAD_DIM*2 (2 because we have K and V)
 
@@ -191,17 +280,20 @@ class Attention:
         """
         MAX_BS = 4
         # TODO: move this outside of the class, so we can store it when this layer gets deleted
-        self.cache_k = torch.zeros((MAX_BS, self.max_seq_len, self.n_kv_heads, self.head_dim), dtype=self.config["torch_dtype"])
-        self.cache_v = torch.zeros((MAX_BS, self.max_seq_len, self.n_kv_heads, self.head_dim), dtype=self.config["torch_dtype"])
+        #self.cache_k = torch.zeros((MAX_BS, self.max_seq_len, self.n_kv_heads, self.head_dim), dtype=self.config["torch_dtype"])
+        #self.cache_v = torch.zeros((MAX_BS, self.max_seq_len, self.n_kv_heads, self.head_dim), dtype=self.config["torch_dtype"])
 
+    """
     def get_cache(self):
         return (self.cache_k, self.cache_v)
 
-    def set_cache(self, cache_k, cache_v):
-        self.cache_k = cache_k
-        self.cache_v = cache_v
+    def set_cache(self, cache_kv: Tuple[torch.Tensor, torch.Tensor]):
+        self.cache_k = cache_kv[0]
+        self.cache_v = cache_kv[1]
+    """
 
-    def forward(self, x: torch.Tensor, start_pos: int, weights, freqs_rope: torch.Tensor, mask: Optional[torch.Tensor]):
+    # TODO: change order of start_pos and weights arguments
+    def forward(self, x: torch.Tensor, start_pos: int, weights: Dict[str, torch.Tensor], cache_k, cache_v, freqs_rope: torch.Tensor, mask: Optional[torch.Tensor]):
         bs, seq_len, _ = x.shape
         
         # Apply attention transformation matrices
@@ -222,15 +314,15 @@ class Attention:
         xq, xk = apply_rotary_emb(xq, xk, freqs_rope=freqs_rope)
 
         # Populate KV cache
-        if self.cache_k is not None:
-            self.cache_k[:bs, start_pos : start_pos + seq_len] = xk
-            keys = self.cache_k[:bs, :start_pos + seq_len]
+        if cache_k is not None:
+            cache_k[:bs, start_pos : start_pos + seq_len] = xk
+            keys = cache_k[:bs, :start_pos + seq_len]
         else:
             # TODO: check if sequence length here is correct, given we start from pos=0
             keys = xk
-        if self.cache_v is not None:
-            self.cache_v[:bs, start_pos : start_pos + seq_len] = xv
-            values = self.cache_v[:bs, :start_pos + seq_len]
+        if cache_v is not None:
+            cache_v[:bs, start_pos : start_pos + seq_len] = xv
+            values = cache_v[:bs, :start_pos + seq_len]
         else:
             # TODO: check if sequence length here is correct, given we start from pos=0
             values = xv
