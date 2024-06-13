@@ -54,7 +54,7 @@ def functional_rmsnorm(inputs: torch.Tensor, weights: torch.Tensor, eps:float = 
     return output * weights
 
 @torch.inference_mode()
-@torch.jit.script
+#@torch.jit.script
 def functional_gqa(
         x: torch.Tensor, 
         start_pos: int, 
@@ -105,6 +105,10 @@ def functional_gqa(
     keys = repeat_kv(keys, n_rep)  # (BS, cache_len + S, n_heads, head_dim)
     values = repeat_kv(values, n_rep)  # (BS, cache_len + S, n_heads, head_dim)
 
+    xq, keys, values = map(lambda x: x.transpose(1, 2), (xq, keys, values))
+
+    """
+
     # Reshapes
     xq = xq.transpose(1, 2)  # (BS, S, n_heads, head_dim) -> (bs, n_heads, S, head_dim)
     keys = keys.transpose(1, 2)  # (BS, cache_len + S, n_heads, head_dim) -> (BS, n_heads, cache_len + S, head_dim)
@@ -119,6 +123,8 @@ def functional_gqa(
     scores = torch.nn.functional.softmax(scores.float(), dim=-1).type_as(xq)
     # Matmul -> (BS, n_heads, S, cache_len + S) @ (BS, n_heads, cache_len + S, head_dim) -> (BS, n_heads, S, head_dim)
     output = torch.matmul(scores, values)
+    """
+    output = torch.nn.functional.scaled_dot_product_attention(xq, keys, values, attn_mask=mask, dropout_p=0.0)
     # # (BS, n_heads, S, head_dim) -> (BS, S, n_heads, head_dim) -> (BS, S, n_heads * head_dim)
     output = output.transpose(1, 2).contiguous().view(bs, seq_len, -1)
     output = torch.nn.functional.linear(output, weights["self_attn.o_proj.weight"])
@@ -138,6 +144,17 @@ def functional_transformer_block(x: torch.Tensor, weights, cache_k, cache_v, sta
     return output
 
 import time
+
+import pickle
+def load_block_chunk(block_chunk_idx):
+    with open(f'LLAMA3-8B-PKL/blocks_chunk_{block_chunk_idx}.pkl', 'rb') as handle:
+        b = pickle.load(handle)
+    return b
+
+def move_to_device(block_chunk, device):
+    for layer_idx in block_chunk.keys():
+        for layer_name in block_chunk[layer_idx].keys():
+            block_chunk[layer_idx][layer_name] = block_chunk[layer_idx][layer_name].to(device)
 
 class Transformer:
     def __init__(self, config, parser, device="cpu", preload_n_transformer_blocks = 16):
@@ -171,6 +188,7 @@ class Transformer:
 
         current_transformer_blocks_loaded = None
         layer_idxs_to_load = []
+        current_chunk = -1
         
         for layer_idx in range(self.num_layers):
             cache_k = self.caches_memory[layer_idx]["k"]
@@ -179,10 +197,14 @@ class Transformer:
                 del current_transformer_blocks_loaded
                 current_transformer_blocks_loaded = None
                 layer_idxs_to_load = [layer_idx + i for i in range(self.preload_n_transformer_blocks)]
+                current_chunk += 1
             if current_transformer_blocks_loaded is None:
                 print(f"Beginning to load layers: {layer_idxs_to_load}")
                 start_t = time.time()
-                current_transformer_blocks_loaded = load_multiple_transformer_block_weights_and_remap(self.parser, self.config, layer_idxs_to_load, device=tokens.device)
+                block_chunk_idx = current_chunk
+                #current_transformer_blocks_loaded = load_multiple_transformer_block_weights_and_remap(self.parser, self.config, layer_idxs_to_load, device=tokens.device)
+                current_transformer_blocks_loaded = load_block_chunk(block_chunk_idx)
+                move_to_device(current_transformer_blocks_loaded, tokens.device)
                 delta_t = time.time() - start_t
                 print(f"Finished to load layers: {layer_idxs_to_load} in {delta_t} seconds.")
             block_weights = current_transformer_blocks_loaded[layer_idx]
