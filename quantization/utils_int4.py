@@ -120,7 +120,7 @@ def linear_forward_int4(x, weight_int4pack, scales_and_zeros, out_features, grou
     c = c.reshape(new_shape)
     return c
 
-def fp32_to_int4_quantize(weight, groupsize: int = 128, inner_k_tiles=8, padding=True):
+def quantize_fp32_linear_to_int4(weight, groupsize: int = 128, inner_k_tiles=8, padding=True):
     # https://github.com/pytorch-labs/gpt-fast/blob/main/quantize.py#L396
     assert groupsize in [32, 64, 128, 256]
     assert inner_k_tiles in [2, 4, 8]
