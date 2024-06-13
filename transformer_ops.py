@@ -71,6 +71,7 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(*shape)
 
+@torch.jit.script
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This function is taken from https://github.com/meta-llama/llama3/blob/main/llama/model.py
@@ -85,7 +86,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
     )
 
-@torch.inference_mode
+@torch.inference_mode()
 def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
@@ -156,22 +157,23 @@ def load_multiple_transformer_block_weights_and_remap(parser, config, layer_idxs
         loaded_weights[layer_idx][remapped_weight_name] = final_weights.to(device)         
     return loaded_weights
 
-@torch.inference_mode
+@torch.inference_mode()
+@torch.jit.script
 def functional_ffn(x: torch.Tensor, weights: Dict[str, torch.Tensor]):
     output = torch.nn.functional.linear(x, weights["mlp.gate_proj.weight"])
     output = torch.nn.functional.silu(output) * torch.nn.functional.linear(x, weights["mlp.up_proj.weight"])
     output = torch.nn.functional.linear(output, weights["mlp.down_proj.weight"])
     return output
 
-@torch.inference_mode
 def _normalization(inputs: torch.Tensor, eps:float = 1e-5) -> torch.Tensor:
     # Assume inputs of shape (B, S, n)
     rms_a = inputs.pow(2).mean(-1, keepdim=True)
     rms_a = inputs * torch.rsqrt(rms_a + eps)
     return rms_a
 
-@torch.inference_mode
-def functional_rmsnorm(inputs: torch.Tensor, weights: Dict[str, torch.Tensor], eps:float = 1e-5) -> torch.Tensor:
+@torch.inference_mode()
+@torch.jit.script
+def functional_rmsnorm(inputs: torch.Tensor, weights: torch.Tensor, eps:float = 1e-5) -> torch.Tensor:
     """
     Root Mean Square Layer Normalization:
     https://arxiv.org/abs/1910.07467
@@ -183,7 +185,8 @@ def functional_rmsnorm(inputs: torch.Tensor, weights: Dict[str, torch.Tensor], e
     output = _normalization(inputs.float()).type_as(inputs)
     return output * weights
 
-@torch.inference_mode
+@torch.inference_mode()
+#@torch.jit.script
 # TODO: change order of start_pos and weights arguments
 def functional_gqa(x: torch.Tensor, start_pos: int, weights: Dict[str, torch.Tensor], cache_k, cache_v, freqs_rope: torch.Tensor, config, mask: Optional[torch.Tensor]):
     n_rep = config["num_attention_heads"] // config["num_key_value_heads"]
@@ -253,16 +256,18 @@ def functional_transformer_block(x: torch.Tensor, weights, cache_k, cache_v, sta
         output = hidden + functional_ffn(attended_hidden, weights)
         return output
 
+import time
+
 # TODO: rewrite majority of layers using functional style, since we want to avoid holding internal state. This will make code more elegant
 class Transformer:
-    def __init__(self, config, parser, device="cpu"):
+    def __init__(self, config, parser, device="cpu", preload_n_transformer_blocks = 16):
         self.device=device
         self.freqs_rope = precompute_rope_constants(
             config["hidden_size"] // config["num_attention_heads"],
             config["max_position_embeddings"] * 2,
             config["rope_theta"],
         ).to(self.device)
-        self.preload_n_transformer_blocks = 16
+        self.preload_n_transformer_blocks = preload_n_transformer_blocks
         self.config = config
         self.num_layers = config["num_hidden_layers"]
         self.parser = parser
@@ -298,7 +303,7 @@ class Transformer:
             caches_memory[layer_idx]["v"] = torch.zeros((max_bs, max_seq_len, n_kv_heads, head_dim), dtype=config["torch_dtype"], device=device)
         return caches_memory
 
-    @torch.inference_mode
+    @torch.inference_mode()
     def _build_mask(self, seq_len, start_pos, device, dtype):
         mask = None
         if seq_len > 1:
@@ -338,7 +343,7 @@ class Transformer:
                 loaded_weights[idx] = self._load_weights_for_block(self.config, idx, device=device)
         return loaded_weights
 
-    @torch.inference_mode
+    @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
         seq_len = tokens.shape[-1]
         seq_embeddings = embedding_matrix(tokens, self.embedding_weights)
@@ -358,7 +363,10 @@ class Transformer:
                 layer_idxs_to_load = [layer_idx + i for i in range(self.preload_n_transformer_blocks)]
             if current_transformer_blocks_loaded is None:
                 print(f"Beginning to load layers: {layer_idxs_to_load}")
+                start_t = time.time()
                 current_transformer_blocks_loaded = load_multiple_transformer_block_weights_and_remap(self.parser, self.config, layer_idxs_to_load, device=tokens.device)
+                delta_t = time.time() - start_t
+                print(f"Finished to load layers: {layer_idxs_to_load} in {delta_t} seconds.")
             block_weights = current_transformer_blocks_loaded[layer_idx]
             layer_idxs_to_load.pop(0) # remove index as "consumed"
             
