@@ -6,6 +6,9 @@ from typing import Dict, Optional, Tuple
 from .utils import build_kv_caches, build_attention_mask, remap_weights_if_needed, load_multiple_transformer_block_weights_and_remap
 from .rope import apply_rotary_emb, precompute_rope_constants
 
+def linear_int8(input, weight, scales):
+    return torch.nn.functional.linear(input, weight.to(dtype=input.dtype)) * scales
+
 def embedding_matrix(inputs, weights):
     # https://pytorch.org/docs/stable/generated/torch.nn.functional.embedding.html
     return torch.nn.functional.embedding(inputs, weights)
@@ -31,6 +34,14 @@ def functional_ffn(x: torch.Tensor, weights: Dict[str, torch.Tensor]):
     output = torch.nn.functional.linear(x, weights["mlp.gate_proj.weight"])
     output = torch.nn.functional.silu(output) * torch.nn.functional.linear(x, weights["mlp.up_proj.weight"])
     output = torch.nn.functional.linear(output, weights["mlp.down_proj.weight"])
+    return output
+
+@torch.inference_mode()
+@torch.jit.script
+def functional_ffn_int8(x: torch.Tensor, weights: Dict[str, torch.Tensor]):
+    output = linear_int8(x, weights["mlp.gate_proj.weight"], weights["mlp.gate_proj.weight_scales"])
+    output = torch.nn.functional.silu(output) * linear_int8(x, weights["mlp.up_proj.weight"], weights["mlp.up_proj.weight_scales"])
+    output = linear_int8(output, weights["mlp.down_proj.weight"], weights["mlp.down_proj.weight_scales"])
     return output
 
 def _normalization(inputs: torch.Tensor, eps:float = 1e-5) -> torch.Tensor:
@@ -130,6 +141,83 @@ def functional_gqa(
     output = torch.nn.functional.linear(output, weights["self_attn.o_proj.weight"])
     return output
 
+@torch.inference_mode()
+#@torch.jit.script
+def functional_gqa_int8(
+        x: torch.Tensor, 
+        start_pos: int, 
+        weights: Dict[str, torch.Tensor], 
+        cache_k: torch.Tensor, 
+        cache_v: torch.Tensor, 
+        freqs_rope: torch.Tensor,
+        n_rep: int,
+        n_kv_heads: int,
+        n_heads: int,
+        head_dim: int,
+        mask: Optional[torch.Tensor]
+    ):
+    bs, seq_len, _ = x.shape
+    
+    # Apply attention transformation matrices
+    # (BS, S, dim) -> (BS, S, n_heads * head_dim)
+    xq = linear_int8(x, weights["self_attn.q_proj.weight"], weights["self_attn.q_proj.weight_scales"])
+    # (BS, S, dim) -> (BS, S, n_kv_heads * head_dim)
+    xk = linear_int8(x, weights["self_attn.k_proj.weight"], weights["self_attn.k_proj.weight_scales"])
+    xv = linear_int8(x, weights["self_attn.v_proj.weight"], weights["self_attn.v_proj.weight_scales"])
+
+    # Reshapes
+    # (BS, S, n_heads * head_dim) -> (BS, S, n_heads, head_dim)
+    xq = xq.view(bs, seq_len, n_heads, head_dim)
+    # (BS, S, n_kv_heads * head_dim) -> (BS, S, n_kv_heads, head_dim)
+    xk = xk.view(bs, seq_len, n_kv_heads, head_dim)
+    xv = xv.view(bs, seq_len, n_kv_heads, head_dim)
+    
+    # Apply positional embeddings
+    xq, xk = apply_rotary_emb(xq, xk, freqs_rope)
+
+    # Populate KV cache
+    if cache_k is not None:
+        cache_k[:bs, start_pos : start_pos + seq_len] = xk
+        keys = cache_k[:bs, :start_pos + seq_len]
+    else:
+        # TODO: check if sequence length here is correct, given we start from pos=0
+        keys = xk
+    if cache_v is not None:
+        cache_v[:bs, start_pos : start_pos + seq_len] = xv
+        values = cache_v[:bs, :start_pos + seq_len]
+    else:
+        # TODO: check if sequence length here is correct, given we start from pos=0
+        values = xv
+
+    # Pad keys and values from n_kv_heads to n_heads, if needed (if n_kv_heads < n_heads)
+    keys = repeat_kv(keys, n_rep)  # (BS, cache_len + S, n_heads, head_dim)
+    values = repeat_kv(values, n_rep)  # (BS, cache_len + S, n_heads, head_dim)
+
+    xq, keys, values = map(lambda x: x.transpose(1, 2), (xq, keys, values))
+
+    """
+
+    # Reshapes
+    xq = xq.transpose(1, 2)  # (BS, S, n_heads, head_dim) -> (bs, n_heads, S, head_dim)
+    keys = keys.transpose(1, 2)  # (BS, cache_len + S, n_heads, head_dim) -> (BS, n_heads, cache_len + S, head_dim)
+    values = values.transpose(1, 2)  # (BS, cache_len + S, n_heads, head_dim) -> (BS, n_heads, cache_len + S, head_dim)
+
+    # Matmul -> (BS, n_heads, S, head_dim) @ (BS, n_heads, head_dim, cache_len + S) -> (BS, n_heads, S, cache_len + S)
+    scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(head_dim)
+
+    if mask is not None:
+        scores = scores + mask
+
+    scores = torch.nn.functional.softmax(scores.float(), dim=-1).type_as(xq)
+    # Matmul -> (BS, n_heads, S, cache_len + S) @ (BS, n_heads, cache_len + S, head_dim) -> (BS, n_heads, S, head_dim)
+    output = torch.matmul(scores, values)
+    """
+    output = torch.nn.functional.scaled_dot_product_attention(xq, keys, values, attn_mask=mask, dropout_p=0.0)
+    # # (BS, n_heads, S, head_dim) -> (BS, S, n_heads, head_dim) -> (BS, S, n_heads * head_dim)
+    output = output.transpose(1, 2).contiguous().view(bs, seq_len, -1)
+    output = linear_int8(output, weights["self_attn.o_proj.weight"], weights["self_attn.o_proj.weight_scales"])
+    return output
+
 def functional_transformer_block(x: torch.Tensor, weights, cache_k, cache_v, start_pos: int, freqs_rope: torch.Tensor, config, mask: Optional[torch.Tensor]):
     # Params needed for GQA
     n_rep = config["num_attention_heads"] // config["num_key_value_heads"]
@@ -138,16 +226,23 @@ def functional_transformer_block(x: torch.Tensor, weights, cache_k, cache_v, sta
     head_dim = config["hidden_size"] // config["num_attention_heads"]
 
     attended_x = functional_rmsnorm(x, weights["input_layernorm.weight"])
-    hidden = x + functional_gqa(attended_x, start_pos, weights, cache_k, cache_v, freqs_rope, n_rep, n_kv_heads, n_heads, head_dim, mask)
+    #hidden = x + functional_gqa(attended_x, start_pos, weights, cache_k, cache_v, freqs_rope, n_rep, n_kv_heads, n_heads, head_dim, mask)
+    hidden = x + functional_gqa_int8(attended_x, start_pos, weights, cache_k, cache_v, freqs_rope, n_rep, n_kv_heads, n_heads, head_dim, mask)
     attended_hidden = functional_rmsnorm(hidden, weights["post_attention_layernorm.weight"])
-    output = hidden + functional_ffn(attended_hidden, weights)
+    #output = hidden + functional_ffn(attended_hidden, weights)
+    output = hidden + functional_ffn_int8(attended_hidden, weights)
     return output
 
 import time
 
 import pickle
 def load_block_chunk(block_chunk_idx):
-    with open(f'LLAMA3-8B-PKL/blocks_chunk_{block_chunk_idx}.pkl', 'rb') as handle:
+    with open(f'LLAMA3-8B-PKL-INT8/blocks_chunk_{block_chunk_idx}.pkl', 'rb') as handle:
+        b = pickle.load(handle)
+    return b
+
+def load_general_chunk():
+    with open(f'LLAMA3-8B-PKL-INT8/general_chunk.pkl', 'rb') as handle:
         b = pickle.load(handle)
     return b
 
@@ -173,10 +268,15 @@ class Transformer:
         self.embedding_weights = parser.get_tensor('model.embed_tokens.weight').to(self.device)
         if config["tie_word_embeddings"]:
             self.output_embedding_weights = self.embedding_weights
-        else:
-            self.output_embedding_weights = parser.get_tensor('lm_head.weight')
-        self.output_embedding_weights = self.output_embedding_weights.to(self.device)
+        #else:
+        #    self.output_embedding_weights = parser.get_tensor('lm_head.weight')
+        #self.output_embedding_weights = self.output_embedding_weights.to(self.device)
         self.output_norm_weights = parser.get_tensor('model.norm.weight').to(self.device)
+
+        self.chunk_weights = load_block_chunk(0) # assume all weights are in single chunk
+        self.general_chunk_weights = load_general_chunk()
+        self.output_embedding_weights = self.general_chunk_weights['lm_head.weight'].to(self.device)
+        self.output_embedding_scales = self.general_chunk_weights['lm_head.weight_scales'].to(self.device)
 
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
@@ -193,6 +293,8 @@ class Transformer:
         for layer_idx in range(self.num_layers):
             cache_k = self.caches_memory[layer_idx]["k"]
             cache_v = self.caches_memory[layer_idx]["v"]
+            block_weights = self.chunk_weights[layer_idx]
+            """
             if len(layer_idxs_to_load) == 0:
                 del current_transformer_blocks_loaded
                 current_transformer_blocks_loaded = None
@@ -209,12 +311,13 @@ class Transformer:
                 print(f"Finished to load layers: {layer_idxs_to_load} in {delta_t} seconds.")
             block_weights = current_transformer_blocks_loaded[layer_idx]
             layer_idxs_to_load.pop(0) # remove index as "consumed"
+            """
             
             #block_weights = self._load_weights_for_block(self.config, layer_idx, device=tokens.device)
             h = functional_transformer_block(h, block_weights, cache_k, cache_v, start_pos, freqs_rope, self.config, mask)
             # delete weights after inference on that block
-            del block_weights
+            #del block_weights
             
         h = functional_rmsnorm(h, self.output_norm_weights)
-        output = torch.nn.functional.linear(h, self.output_embedding_weights).float()
+        output = linear_int8(h, self.output_embedding_weights, self.output_embedding_scales).float()
         return output
