@@ -274,6 +274,7 @@ class Transformer:
         self.output_norm_weights = parser.get_tensor('model.norm.weight').to(self.device)
 
         self.chunk_weights = load_block_chunk(0) # assume all weights are in single chunk
+        move_to_device(self.chunk_weights, self.device)
         self.general_chunk_weights = load_general_chunk()
         self.output_embedding_weights = self.general_chunk_weights['lm_head.weight'].to(self.device)
         self.output_embedding_scales = self.general_chunk_weights['lm_head.weight_scales'].to(self.device)
