@@ -85,6 +85,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
     )
 
+@torch.inference_mode
 def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
@@ -155,6 +156,103 @@ def load_multiple_transformer_block_weights_and_remap(parser, config, layer_idxs
         loaded_weights[layer_idx][remapped_weight_name] = final_weights.to(device)         
     return loaded_weights
 
+@torch.inference_mode
+def functional_ffn(x: torch.Tensor, weights: Dict[str, torch.Tensor]):
+    output = torch.nn.functional.linear(x, weights["mlp.gate_proj.weight"])
+    output = torch.nn.functional.silu(output) * torch.nn.functional.linear(x, weights["mlp.up_proj.weight"])
+    output = torch.nn.functional.linear(output, weights["mlp.down_proj.weight"])
+    return output
+
+@torch.inference_mode
+def _normalization(inputs: torch.Tensor, eps:float = 1e-5) -> torch.Tensor:
+    # Assume inputs of shape (B, S, n)
+    rms_a = inputs.pow(2).mean(-1, keepdim=True)
+    rms_a = inputs * torch.rsqrt(rms_a + eps)
+    return rms_a
+
+@torch.inference_mode
+def functional_rmsnorm(inputs: torch.Tensor, weights: Dict[str, torch.Tensor], eps:float = 1e-5) -> torch.Tensor:
+    """
+    Root Mean Square Layer Normalization:
+    https://arxiv.org/abs/1910.07467
+
+    In the original paper inputs = a, weights = g (gain)
+    """
+    # TODO: make this conversion generalizable as a function
+    # Perform operation in fp32 precision
+    output = _normalization(inputs.float()).type_as(inputs)
+    return output * weights
+
+@torch.inference_mode
+# TODO: change order of start_pos and weights arguments
+def functional_gqa(x: torch.Tensor, start_pos: int, weights: Dict[str, torch.Tensor], cache_k, cache_v, freqs_rope: torch.Tensor, config, mask: Optional[torch.Tensor]):
+    n_rep = config["num_attention_heads"] // config["num_key_value_heads"]
+    n_kv_heads = config["num_key_value_heads"]
+    n_heads = config["num_attention_heads"]
+    head_dim = config["hidden_size"] // config["num_attention_heads"]
+    bs, seq_len, _ = x.shape
+    
+    # Apply attention transformation matrices
+    # (BS, S, dim) -> (BS, S, n_heads * head_dim)
+    xq = torch.nn.functional.linear(x, weights["self_attn.q_proj.weight"])
+    # (BS, S, dim) -> (BS, S, n_kv_heads * head_dim)
+    xk = torch.nn.functional.linear(x, weights["self_attn.k_proj.weight"])
+    xv = torch.nn.functional.linear(x, weights["self_attn.v_proj.weight"])
+
+    # Reshapes
+    # (BS, S, n_heads * head_dim) -> (BS, S, n_heads, head_dim)
+    xq = xq.view(bs, seq_len, n_heads, head_dim)
+    # (BS, S, n_kv_heads * head_dim) -> (BS, S, n_kv_heads, head_dim)
+    xk = xk.view(bs, seq_len, n_kv_heads, head_dim)
+    xv = xv.view(bs, seq_len, n_kv_heads, head_dim)
+    
+    # Apply positional embeddings
+    xq, xk = apply_rotary_emb(xq, xk, freqs_rope=freqs_rope)
+
+    # Populate KV cache
+    if cache_k is not None:
+        cache_k[:bs, start_pos : start_pos + seq_len] = xk
+        keys = cache_k[:bs, :start_pos + seq_len]
+    else:
+        # TODO: check if sequence length here is correct, given we start from pos=0
+        keys = xk
+    if cache_v is not None:
+        cache_v[:bs, start_pos : start_pos + seq_len] = xv
+        values = cache_v[:bs, :start_pos + seq_len]
+    else:
+        # TODO: check if sequence length here is correct, given we start from pos=0
+        values = xv
+
+    # Pad keys and values from n_kv_heads to n_heads, if needed (if n_kv_heads < n_heads)
+    keys = repeat_kv(keys, n_rep)  # (BS, cache_len + S, n_heads, head_dim)
+    values = repeat_kv(values, n_rep)  # (BS, cache_len + S, n_heads, head_dim)
+
+    # Reshapes
+    xq = xq.transpose(1, 2)  # (BS, S, n_heads, head_dim) -> (bs, n_heads, S, head_dim)
+    keys = keys.transpose(1, 2)  # (BS, cache_len + S, n_heads, head_dim) -> (BS, n_heads, cache_len + S, head_dim)
+    values = values.transpose(1, 2)  # (BS, cache_len + S, n_heads, head_dim) -> (BS, n_heads, cache_len + S, head_dim)
+
+    # Matmul -> (BS, n_heads, S, head_dim) @ (BS, n_heads, head_dim, cache_len + S) -> (BS, n_heads, S, cache_len + S)
+    scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(head_dim)
+
+    if mask is not None:
+        scores = scores + mask
+
+    scores = torch.nn.functional.softmax(scores.float(), dim=-1).type_as(xq)
+    # Matmul -> (BS, n_heads, S, cache_len + S) @ (BS, n_heads, cache_len + S, head_dim) -> (BS, n_heads, S, head_dim)
+    output = torch.matmul(scores, values)
+    # # (BS, n_heads, S, head_dim) -> (BS, S, n_heads, head_dim) -> (BS, S, n_heads * head_dim)
+    output = output.transpose(1, 2).contiguous().view(bs, seq_len, -1)
+    output = torch.nn.functional.linear(output, weights["self_attn.o_proj.weight"])
+    return output
+
+def functional_transformer_block(x: torch.Tensor, weights, cache_k, cache_v, start_pos: int, freqs_rope: torch.Tensor, config, mask: Optional[torch.Tensor]):
+        attended_x = functional_rmsnorm(x, weights["input_layernorm.weight"])
+        hidden = x + functional_gqa(attended_x, start_pos, weights, cache_k, cache_v, freqs_rope, config, mask)
+        attended_hidden = functional_rmsnorm(hidden, weights["post_attention_layernorm.weight"])
+        output = hidden + functional_ffn(attended_hidden, weights)
+        return output
+
 # TODO: rewrite majority of layers using functional style, since we want to avoid holding internal state. This will make code more elegant
 class Transformer:
     def __init__(self, config, parser, device="cpu"):
@@ -164,12 +262,11 @@ class Transformer:
             config["max_position_embeddings"] * 2,
             config["rope_theta"],
         ).to(self.device)
-        self.preload_n_transformer_blocks = 6
+        self.preload_n_transformer_blocks = 16
         self.config = config
         self.num_layers = config["num_hidden_layers"]
         self.parser = parser
         self.caches_memory = self._build_kv_caches(config, device=self.device)
-        self.transformer_block = TransformerBlock(config)
 
         self.embedding_weights = parser.get_tensor('model.embed_tokens.weight').to(self.device)
         if config["tie_word_embeddings"]:
@@ -177,7 +274,6 @@ class Transformer:
         else:
             self.output_embedding_weights = parser.get_tensor('lm_head.weight')
         self.output_embedding_weights = self.output_embedding_weights.to(self.device)
-        self.output_norm = RMSNorm()
         self.output_norm_weights = parser.get_tensor('model.norm.weight').to(self.device)
 
     def _build_kv_caches(self, config, device, max_seq_len=2048, max_bs=4):
@@ -202,6 +298,7 @@ class Transformer:
             caches_memory[layer_idx]["v"] = torch.zeros((max_bs, max_seq_len, n_kv_heads, head_dim), dtype=config["torch_dtype"], device=device)
         return caches_memory
 
+    @torch.inference_mode
     def _build_mask(self, seq_len, start_pos, device, dtype):
         mask = None
         if seq_len > 1:
@@ -240,7 +337,8 @@ class Transformer:
             if idx < self.num_layers:
                 loaded_weights[idx] = self._load_weights_for_block(self.config, idx, device=device)
         return loaded_weights
-    
+
+    @torch.inference_mode
     def forward(self, tokens: torch.Tensor, start_pos: int):
         seq_len = tokens.shape[-1]
         seq_embeddings = embedding_matrix(tokens, self.embedding_weights)
@@ -259,158 +357,16 @@ class Transformer:
                 current_transformer_blocks_loaded = None
                 layer_idxs_to_load = [layer_idx + i for i in range(self.preload_n_transformer_blocks)]
             if current_transformer_blocks_loaded is None:
+                print(f"Beginning to load layers: {layer_idxs_to_load}")
                 current_transformer_blocks_loaded = load_multiple_transformer_block_weights_and_remap(self.parser, self.config, layer_idxs_to_load, device=tokens.device)
             block_weights = current_transformer_blocks_loaded[layer_idx]
             layer_idxs_to_load.pop(0) # remove index as "consumed"
             
             #block_weights = self._load_weights_for_block(self.config, layer_idx, device=tokens.device)
-            h = self.transformer_block.forward(h, block_weights, cache_k, cache_v, start_pos, freqs_rope, mask)
+            h = functional_transformer_block(h, block_weights, cache_k, cache_v, start_pos, freqs_rope, self.config, mask)
             # delete weights after inference on that block
             del block_weights
             
-        h = self.output_norm.forward(h, self.output_norm_weights)
+        h = functional_rmsnorm(h, self.output_norm_weights)
         output = torch.nn.functional.linear(h, self.output_embedding_weights).float()
-        return output
-
-class TransformerBlock:
-    def __init__(self, config):
-        self.attention=Attention(config)
-        self.attention_norm = RMSNorm()
-        self.ffn_norm = RMSNorm()
-        self.ffn = FFN()
-
-    def forward(self, x: torch.Tensor, weights, cache_k, cache_v, start_pos: int, freqs_rope: torch.Tensor, mask: Optional[torch.Tensor]):
-        attended_x = self.attention_norm.forward(x, weights["input_layernorm.weight"])
-        hidden = x + self.attention.forward(attended_x, start_pos, weights, cache_k, cache_v, freqs_rope, mask)
-        attended_hidden = self.ffn_norm.forward(hidden, weights["post_attention_layernorm.weight"])
-        output = hidden + self.ffn.forward(attended_hidden, weights)
-        return output
-
-class FFN():
-    def __init__(
-        self,
-    ):
-        pass
-
-    def forward(self, x: torch.Tensor, weights: Dict[str, torch.Tensor]):
-        output = torch.nn.functional.linear(x, weights["mlp.gate_proj.weight"])
-        output = torch.nn.functional.silu(output) * torch.nn.functional.linear(x, weights["mlp.up_proj.weight"])
-        output = torch.nn.functional.linear(output, weights["mlp.down_proj.weight"])
-        return output
-
-class RMSNorm:
-    """
-    Root Mean Square Layer Normalization:
-    https://arxiv.org/abs/1910.07467
-    """
-    def __init__(self, eps=1e-05):
-        #super().__init__()
-        self.eps = eps
-        pass
-
-    def _normalization(self, inputs: torch.Tensor) -> torch.Tensor:
-        # Assume inputs of shape (B, S, n)
-        rms_a = inputs.pow(2).mean(-1, keepdim=True)
-        rms_a = inputs * torch.rsqrt(rms_a + self.eps)
-        return rms_a
-
-    def forward(self, inputs: torch.Tensor, weights: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        In the original paper inputs = a, weights = g (gain)
-        """
-        # TODO: make this conversion generalizable as a function
-        # Perform operation in fp32 precision
-        output = self._normalization(inputs.float()).type_as(inputs)
-        return output * weights
-
-class Attention:
-    def __init__(self, config, max_seq_len=2048):
-        self.config = config
-        self.n_rep = config["num_attention_heads"] // config["num_key_value_heads"]
-        self.n_kv_heads = config["num_key_value_heads"]
-        self.n_heads = config["num_attention_heads"]
-        self.head_dim = config["hidden_size"] // config["num_attention_heads"]
-        #self.max_seq_len = max_seq_len
-        """
-        KV cache, memory occupation: MAX_BS*MAX_SEQ_LEN*N_KV_HEADS*HEAD_DIM*2 (2 because we have K and V)
-
-        MAX_BS = 1
-        MAX_SEQ_LEN = 2048 (can be up to 8192)
-        N_KV_HEADS = 8
-        HEAD_DIM = dim//n_heads=4096//32=128
-
-        Total per layer = 1 * 2048 * 8 * 128 * 2 = 4194304 entries
-        Bytes per layer = 4194304 * 4 (assuming float) = 16777216 bytes (16MB per layer)
-        Bytes per model = 16777216 * NUM_LAYERS = 16777216 * 32 = 536870912 (512MB per model)
-        """
-        MAX_BS = 4
-        # TODO: move this outside of the class, so we can store it when this layer gets deleted
-        #self.cache_k = torch.zeros((MAX_BS, self.max_seq_len, self.n_kv_heads, self.head_dim), dtype=self.config["torch_dtype"])
-        #self.cache_v = torch.zeros((MAX_BS, self.max_seq_len, self.n_kv_heads, self.head_dim), dtype=self.config["torch_dtype"])
-
-    """
-    def get_cache(self):
-        return (self.cache_k, self.cache_v)
-
-    def set_cache(self, cache_kv: Tuple[torch.Tensor, torch.Tensor]):
-        self.cache_k = cache_kv[0]
-        self.cache_v = cache_kv[1]
-    """
-
-    # TODO: change order of start_pos and weights arguments
-    def forward(self, x: torch.Tensor, start_pos: int, weights: Dict[str, torch.Tensor], cache_k, cache_v, freqs_rope: torch.Tensor, mask: Optional[torch.Tensor]):
-        bs, seq_len, _ = x.shape
-        
-        # Apply attention transformation matrices
-        # (BS, S, dim) -> (BS, S, n_heads * head_dim)
-        xq = torch.nn.functional.linear(x, weights["self_attn.q_proj.weight"])
-        # (BS, S, dim) -> (BS, S, n_kv_heads * head_dim)
-        xk = torch.nn.functional.linear(x, weights["self_attn.k_proj.weight"])
-        xv = torch.nn.functional.linear(x, weights["self_attn.v_proj.weight"])
-
-        # Reshapes
-        # (BS, S, n_heads * head_dim) -> (BS, S, n_heads, head_dim)
-        xq = xq.view(bs, seq_len, self.n_heads, self.head_dim)
-        # (BS, S, n_kv_heads * head_dim) -> (BS, S, n_kv_heads, head_dim)
-        xk = xk.view(bs, seq_len, self.n_kv_heads, self.head_dim)
-        xv = xv.view(bs, seq_len, self.n_kv_heads, self.head_dim)
-        
-        # Apply positional embeddings
-        xq, xk = apply_rotary_emb(xq, xk, freqs_rope=freqs_rope)
-
-        # Populate KV cache
-        if cache_k is not None:
-            cache_k[:bs, start_pos : start_pos + seq_len] = xk
-            keys = cache_k[:bs, :start_pos + seq_len]
-        else:
-            # TODO: check if sequence length here is correct, given we start from pos=0
-            keys = xk
-        if cache_v is not None:
-            cache_v[:bs, start_pos : start_pos + seq_len] = xv
-            values = cache_v[:bs, :start_pos + seq_len]
-        else:
-            # TODO: check if sequence length here is correct, given we start from pos=0
-            values = xv
-
-        # Pad keys and values from n_kv_heads to n_heads, if needed (if n_kv_heads < n_heads)
-        keys = repeat_kv(keys, self.n_rep)  # (BS, cache_len + S, n_heads, head_dim)
-        values = repeat_kv(values, self.n_rep)  # (BS, cache_len + S, n_heads, head_dim)
-
-        # Reshapes
-        xq = xq.transpose(1, 2)  # (BS, S, n_heads, head_dim) -> (bs, n_heads, S, head_dim)
-        keys = keys.transpose(1, 2)  # (BS, cache_len + S, n_heads, head_dim) -> (BS, n_heads, cache_len + S, head_dim)
-        values = values.transpose(1, 2)  # (BS, cache_len + S, n_heads, head_dim) -> (BS, n_heads, cache_len + S, head_dim)
-
-        # Matmul -> (BS, n_heads, S, head_dim) @ (BS, n_heads, head_dim, cache_len + S) -> (BS, n_heads, S, cache_len + S)
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-        if mask is not None:
-            scores = scores + mask
-
-        scores = torch.nn.functional.softmax(scores.float(), dim=-1).type_as(xq)
-        # Matmul -> (BS, n_heads, S, cache_len + S) @ (BS, n_heads, cache_len + S, head_dim) -> (BS, n_heads, S, head_dim)
-        output = torch.matmul(scores, values)
-        # # (BS, n_heads, S, head_dim) -> (BS, S, n_heads, head_dim) -> (BS, S, n_heads * head_dim)
-        output = output.transpose(1, 2).contiguous().view(bs, seq_len, -1)
-        output = torch.nn.functional.linear(output, weights["self_attn.o_proj.weight"])
         return output
