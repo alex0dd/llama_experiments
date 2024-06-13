@@ -25,6 +25,7 @@ def precompute_rope_constants(dim: int, end: int, theta: float = 10000.0) -> tor
     return freqs_rope
 
 @torch.inference_mode()
+@torch.jit.ignore
 def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
@@ -37,6 +38,10 @@ def apply_rotary_emb(
     This function is taken and adapted from https://github.com/meta-llama/llama3/blob/main/llama/model.py
     It applies rotatory positional embedding to query and key vectors, performing only one reshape of rope frequencies.
     """ 
+    #xq_shape = xq.shape
+    #xk_shape = xk.shape
+    #xq_ = torch.view_as_complex(xq.float().reshape(xq_shape[0], xq_shape[1], xq_shape[2], -1, 2))
+    #xk_ = torch.view_as_complex(xk.float().reshape(xk_shape[0], xk_shape[1], xk_shape[2], -1, 2))
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     freqs_rope = reshape_for_broadcast(freqs_rope, xq_)

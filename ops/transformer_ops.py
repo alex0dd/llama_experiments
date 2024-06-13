@@ -54,21 +54,20 @@ def functional_rmsnorm(inputs: torch.Tensor, weights: torch.Tensor, eps:float = 
     return output * weights
 
 @torch.inference_mode()
-#@torch.jit.script
+@torch.jit.script
 def functional_gqa(
         x: torch.Tensor, 
         start_pos: int, 
         weights: Dict[str, torch.Tensor], 
         cache_k: torch.Tensor, 
         cache_v: torch.Tensor, 
-        freqs_rope: torch.Tensor, 
-        config, 
+        freqs_rope: torch.Tensor,
+        n_rep: int,
+        n_kv_heads: int,
+        n_heads: int,
+        head_dim: int,
         mask: Optional[torch.Tensor]
     ):
-    n_rep = config["num_attention_heads"] // config["num_key_value_heads"]
-    n_kv_heads = config["num_key_value_heads"]
-    n_heads = config["num_attention_heads"]
-    head_dim = config["hidden_size"] // config["num_attention_heads"]
     bs, seq_len, _ = x.shape
     
     # Apply attention transformation matrices
@@ -86,7 +85,7 @@ def functional_gqa(
     xv = xv.view(bs, seq_len, n_kv_heads, head_dim)
     
     # Apply positional embeddings
-    xq, xk = apply_rotary_emb(xq, xk, freqs_rope=freqs_rope)
+    xq, xk = apply_rotary_emb(xq, xk, freqs_rope)
 
     # Populate KV cache
     if cache_k is not None:
@@ -126,8 +125,14 @@ def functional_gqa(
     return output
 
 def functional_transformer_block(x: torch.Tensor, weights, cache_k, cache_v, start_pos: int, freqs_rope: torch.Tensor, config, mask: Optional[torch.Tensor]):
+    # Params needed for GQA
+    n_rep = config["num_attention_heads"] // config["num_key_value_heads"]
+    n_kv_heads = config["num_key_value_heads"]
+    n_heads = config["num_attention_heads"]
+    head_dim = config["hidden_size"] // config["num_attention_heads"]
+
     attended_x = functional_rmsnorm(x, weights["input_layernorm.weight"])
-    hidden = x + functional_gqa(attended_x, start_pos, weights, cache_k, cache_v, freqs_rope, config, mask)
+    hidden = x + functional_gqa(attended_x, start_pos, weights, cache_k, cache_v, freqs_rope, n_rep, n_kv_heads, n_heads, head_dim, mask)
     attended_hidden = functional_rmsnorm(hidden, weights["post_attention_layernorm.weight"])
     output = hidden + functional_ffn(attended_hidden, weights)
     return output
