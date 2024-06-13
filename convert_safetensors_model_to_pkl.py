@@ -8,7 +8,7 @@ import time
 import os
 
 from ops.utils import load_multiple_transformer_block_weights_and_remap
-from quantization_utils import quantize_fp32_linear_to_int8
+from quantization.utils_int8 import quantize_fp32_linear_to_int8
 
 def is_linear_weight(layer_name):
     return "mlp." in layer_name and ".weight" in layer_name
