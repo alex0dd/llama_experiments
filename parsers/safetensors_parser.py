@@ -1,7 +1,10 @@
 import json
 
-from utils import bytes_to_uint, load_tensor_from_memory
+from utils import bytes_to_uint, load_tensor_from_memory, MultiFileHandler
 from utils import parse_bf16_tensor_v3 as parse_bf16_tensor
+
+import torch
+from typing import Dict, List
 
 class SafeTensorsParser:
 
@@ -52,20 +55,39 @@ class SafeTensorsParser:
             tensor_metadata[key] = value
         return tensor_metadata, metadata
 
-    def _get_tensor_data_raw(self, name):
-        # Loads the tensor from secondary memory, only when requested
+    def _get_tensor_data_raw_mfh(self, name, file_handler):
+        # Loads the tensor from secondary memory, using a given file handler
         start_tensor_offset = self._tensor_metadata[name]["data_offsets"][0]
         end_tensor_offset = self._tensor_metadata[name]["data_offsets"][1]
         begin_pos = start_tensor_offset + self._data_base_offset
         n_of_bytes = end_tensor_offset - start_tensor_offset
         # read the data
-        data_raw = load_tensor_from_memory(self._file_path, begin_pos, n_of_bytes)
+        data_raw = file_handler.read_bytes(self._file_path, begin_pos, n_of_bytes)
+        return data_raw
+
+    def _get_tensor_data_raw(self, name):
+        # read the data
+        with MultiFileHandler(self._file_path) as file_handler:
+            data_raw = self._get_tensor_data_raw_mfh(name, file_handler)
         return data_raw
     
-    def get_tensor(self, name):
+    def get_tensor(self, name, file_handler=None):
         assert name in self.tensor_names, f"Tensor {name} is not in list of tensor names loaded from {self._file_path}"
         shape = self._tensor_metadata[name]["shape"]
-        current_tensor_raw = self._get_tensor_data_raw(name)
+        if file_handler is None:
+            current_tensor_raw = self._get_tensor_data_raw(name)
+        else:
+            current_tensor_raw = self._get_tensor_data_raw_mfh(name, file_handler)
         current_tensor = parse_bf16_tensor(current_tensor_raw, shape)
         # TODO: add parsing cache, so that if a tensor was parsed, it can be offloaded to HDD or in RAM
         return current_tensor
+
+    def get_tensors_without_closing_file(self, names: List[str]) -> Dict[str, torch.Tensor]:
+        for name in names: assert name in self.tensor_names, f"Tensor {name} is not in list of tensor names loaded from {self._file_path}"
+        outputs = {}
+        # Using a single file read, read all the required tensors from it at once.
+        with MultiFileHandler(self._file_path) as file_handler:
+            for name in names:
+                outputs[name] = self.get_tensor(name, file_handler=file_handler)
+        return outputs
+                

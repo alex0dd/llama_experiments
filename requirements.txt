@@ -1,3 +1,5 @@
 safetensors
 numpy
 torch
+jupyterlab
+transformers

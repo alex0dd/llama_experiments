@@ -1,3 +1,4 @@
+from collections import defaultdict
 import torch
 import math
 from typing import Dict, Optional, Tuple
@@ -115,6 +116,45 @@ def precompute_rope_constants(dim: int, end: int, theta: float = 10000.0):
     freqs_rope = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_rope
 
+def get_all_layer_names_in_block(layer_idx):
+    weight_remap = {
+        f'model.layers.{layer_idx}.mlp.down_proj.weight': 'mlp.down_proj.weight',
+        f'model.layers.{layer_idx}.mlp.gate_proj.weight': 'mlp.gate_proj.weight',
+        f'model.layers.{layer_idx}.mlp.up_proj.weight': 'mlp.up_proj.weight',
+        f'model.layers.{layer_idx}.input_layernorm.weight': 'input_layernorm.weight',
+        f'model.layers.{layer_idx}.post_attention_layernorm.weight': 'post_attention_layernorm.weight'
+    }
+    for letter in ['q', 'k', 'v', 'o']:
+        orig_key = f'model.layers.{layer_idx}.self_attn.{letter}_proj.weight'
+        new_key = f'self_attn.{letter}_proj.weight'
+        weight_remap[orig_key] = new_key
+    return weight_remap
+
+def load_multiple_transformer_block_weights_and_remap(parser, config, layer_idxs, device):
+    """
+    Helper function that loads all the weights for given transformer block indices minimizing
+    the number of file reads, and transfers them to the given decide.
+    """
+    num_layers = config["num_hidden_layers"]
+    loaded_weights = defaultdict(dict)
+    all_weights_remap = {}
+    # Get all the layer names
+    for idx in layer_idxs:
+        if idx < num_layers:
+            weight_remap = get_all_layer_names_in_block(idx)
+            all_weights_remap.update(weight_remap)
+            #loaded_weights[idx] = self._load_weights_for_block(self.config, idx, device=device)
+    # Load all weights opening the F files exactly F times.
+    all_loaded_weights = parser.get_tensors(list(all_weights_remap.keys()))
+    # Assign the loaded weights to the appropriate loaded_weights dict fields.
+    for weight_name in all_loaded_weights.keys():
+        layer_idx = int(weight_name.split(".")[2])
+        remapped_weight_name = all_weights_remap[weight_name]
+        # Move the original loaded weight with original weight name, into the loaded_weights dict (and repermute it if needed, e.g. in attn q, k cases)
+        final_weights = remap_weights_if_needed(all_loaded_weights[weight_name], weight_name, config)
+        loaded_weights[layer_idx][remapped_weight_name] = final_weights.to(device)         
+    return loaded_weights
+
 # TODO: rewrite majority of layers using functional style, since we want to avoid holding internal state. This will make code more elegant
 class Transformer:
     def __init__(self, config, parser, device="cpu"):
@@ -124,6 +164,7 @@ class Transformer:
             config["max_position_embeddings"] * 2,
             config["rope_theta"],
         ).to(self.device)
+        self.preload_n_transformer_blocks = 6
         self.config = config
         self.num_layers = config["num_hidden_layers"]
         self.parser = parser
@@ -193,20 +234,40 @@ class Transformer:
             weights[key] = weights[key].to(device)
         return weights
 
+    def _bulk_weights_loader(self, config, layer_idxs, device):
+        loaded_weights = {}
+        for idx in layer_idxs:
+            if idx < self.num_layers:
+                loaded_weights[idx] = self._load_weights_for_block(self.config, idx, device=device)
+        return loaded_weights
+    
     def forward(self, tokens: torch.Tensor, start_pos: int):
         seq_len = tokens.shape[-1]
         seq_embeddings = embedding_matrix(tokens, self.embedding_weights)
         freqs_rope = self.freqs_rope[start_pos : start_pos + seq_len]
         mask = self._build_mask(seq_len, start_pos, device=tokens.device, dtype=seq_embeddings.dtype)
         h = seq_embeddings
+
+        current_transformer_blocks_loaded = None
+        layer_idxs_to_load = []
         
         for layer_idx in range(self.num_layers):
             cache_k = self.caches_memory[layer_idx]["k"]
             cache_v = self.caches_memory[layer_idx]["v"]
-            block_weights = self._load_weights_for_block(self.config, layer_idx, device=tokens.device)
+            if len(layer_idxs_to_load) == 0:
+                del current_transformer_blocks_loaded
+                current_transformer_blocks_loaded = None
+                layer_idxs_to_load = [layer_idx + i for i in range(self.preload_n_transformer_blocks)]
+            if current_transformer_blocks_loaded is None:
+                current_transformer_blocks_loaded = load_multiple_transformer_block_weights_and_remap(self.parser, self.config, layer_idxs_to_load, device=tokens.device)
+            block_weights = current_transformer_blocks_loaded[layer_idx]
+            layer_idxs_to_load.pop(0) # remove index as "consumed"
+            
+            #block_weights = self._load_weights_for_block(self.config, layer_idx, device=tokens.device)
             h = self.transformer_block.forward(h, block_weights, cache_k, cache_v, start_pos, freqs_rope, mask)
             # delete weights after inference on that block
             del block_weights
+            
         h = self.output_norm.forward(h, self.output_norm_weights)
         output = torch.nn.functional.linear(h, self.output_embedding_weights).float()
         return output

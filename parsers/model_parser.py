@@ -1,3 +1,4 @@
+from collections import defaultdict
 from itertools import chain
 from typing import Dict, List, Tuple
 
@@ -25,7 +26,20 @@ class ModelParser:
         parser = self._tensors_parsers_map[tensor_name]
         return parser.get_tensor(tensor_name)
 
-    
+    def get_tensors(self, tensor_names: List[str]):
+        for tensor_name in tensor_names: tensor_name in self.tensor_names, f"Tensor {tensor_name} is not present in loaded tensors"
+        output_dict = {}
+        parser_tensor_read_map = defaultdict(list)
+        # Get all the parsers and their associated tensor names
+        for tensor_name in tensor_names:
+            parser = self._tensors_parsers_map[tensor_name]
+            parser_tensor_read_map[parser].append(tensor_name)
+        # For each parser, read all the necessary tensors from it at once.
+        for parser in parser_tensor_read_map.keys():
+            tensors_dict = parser.get_tensors_without_closing_file(parser_tensor_read_map[parser])
+            output_dict.update(tensors_dict)
+        return output_dict
+
     def _build_tensors_parsers_map(self, parsers_dict: Dict[str, SafeTensorsParser]) -> Dict[str, SafeTensorsParser]:
         """
         Associates a parser reference to each tensor name for later quick mapping of parsers.
