@@ -8,6 +8,7 @@ import time
 import os
 
 from ops.utils import load_multiple_transformer_block_weights_and_remap
+from quantization.utils_int4 import quantize_fp32_linear_to_int4
 from quantization.utils_int8 import quantize_fp32_linear_to_int8
 
 def is_linear_weight(layer_name):
@@ -16,17 +17,26 @@ def is_linear_weight(layer_name):
 def is_attention_linear(layer_name):
     return "self_attn." in layer_name and "proj.weight" in layer_name
 
-def quantize_all_mlps(blocks_chunk):
+def quantize_all_mlps(blocks_chunk, quant_type="int8"):
     for layer_idx in blocks_chunk.keys():
         blocks_update_dict = {}
         for layer_name in blocks_chunk[layer_idx].keys():
             if is_linear_weight(layer_name) or is_attention_linear(layer_name):
-                block_int8, block_scale = quantize_fp32_linear_to_int8(blocks_chunk[layer_idx][layer_name])
-                blocks_chunk[layer_idx][layer_name] = block_int8
+                if quant_type == "int8":
+                    block_quantized, block_scale = quantize_fp32_linear_to_int8(blocks_chunk[layer_idx][layer_name])
+                elif quant_type == "int4":
+                    block_quantized, block_scale = quantize_fp32_linear_to_int4(blocks_chunk[layer_idx][layer_name], layer_name)
+                
+                # We'll always store original shapes for later code compatibility
+                orig_shapes = blocks_chunk[layer_idx][layer_name].shape
+                
+                blocks_chunk[layer_idx][layer_name] = block_quantized
                 blocks_update_dict[layer_name+"_scales"] = block_scale
+                blocks_update_dict[layer_name+"_orig_shape"] = orig_shapes
         blocks_chunk[layer_idx].update(blocks_update_dict)
 
-quantize_to_int8 = True
+quantization_type = "int4"
+assert quantization_type in ["int4", "int8", None]
 
 model_parser = ModelParser([
     "./Meta-Llama-3-8B/model-00001-of-00004.safetensors",
@@ -64,7 +74,10 @@ config = {
   "vocab_size": 128256
 }
 
-converted_model_path = "LLAMA3-8B-PKL-INT8"
+converted_model_path = "LLAMA3-8B-PKL"+("" if not quantization_type else f"-{quantization_type}")
+
+if not os.path.exists(converted_model_path):
+    os.makedirs(converted_model_path)
 
 num_layers = config["num_hidden_layers"]
 preload_n_transformer_blocks = 32
@@ -81,8 +94,8 @@ for layer_idx in range(num_layers):
         print(f"Beginning to load layers: {layer_idxs_to_load}")
         start_t = time.time()
         current_transformer_blocks_loaded = load_multiple_transformer_block_weights_and_remap(model_parser, config, layer_idxs_to_load, device="cpu")
-        if quantize_to_int8:
-            quantize_all_mlps(current_transformer_blocks_loaded)
+        if quantization_type:
+            quantize_all_mlps(current_transformer_blocks_loaded, quant_type=quantization_type)
         delta_t = time.time() - start_t
         print(f"Finished to load layers: {layer_idxs_to_load} in {delta_t} seconds.")
         with open(os.path.join(converted_model_path, f"blocks_chunk_{current_chunk}.pkl"), "wb") as f:
@@ -91,7 +104,7 @@ for layer_idx in range(num_layers):
 
 embedding_weights = model_parser.get_tensor('model.embed_tokens.weight')
 output_norm_weights = model_parser.get_tensor('model.norm.weight')
-if quantize_to_int8:
+if quantization_type:
     output_embedding_weights = model_parser.get_tensor('lm_head.weight')
     
 
@@ -99,10 +112,15 @@ general_chunk_dict = {
     'model.embed_tokens.weight': embedding_weights,
     'model.norm.weight': output_norm_weights,
 }
-if quantize_to_int8:
-    output_embedding_weights, output_embedding_scales = quantize_fp32_linear_to_int8(output_embedding_weights)
+if quantization_type:
+    orig_shapes = output_embedding_weights.shape
+    if quantization_type == "int8":
+        output_embedding_weights, output_embedding_scales = quantize_fp32_linear_to_int8(output_embedding_weights)
+    elif quantization_type == "int4":
+        output_embedding_weights, output_embedding_scales = quantize_fp32_linear_to_int4(output_embedding_weights, quantization_type)
     general_chunk_dict['lm_head.weight'] = output_embedding_weights
     general_chunk_dict['lm_head.weight_scales'] = output_embedding_scales
+    general_chunk_dict['lm_head.weight_orig_shape'] = orig_shapes
 else:
     general_chunk_dict['lm_head.weight'] = output_embedding_weights
 

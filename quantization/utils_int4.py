@@ -120,7 +120,7 @@ def linear_forward_int4(x, weight_int4pack, scales_and_zeros, out_features, grou
     c = c.reshape(new_shape)
     return c
 
-def quantize_fp32_linear_to_int4(weight, groupsize: int = 128, inner_k_tiles=8, padding=True):
+def quantize_fp32_linear_to_int4(weight, layer_name, groupsize: int = 128, inner_k_tiles=8, padding=True):
     # https://github.com/pytorch-labs/gpt-fast/blob/main/quantize.py#L396
     assert groupsize in [32, 64, 128, 256]
     assert inner_k_tiles in [2, 4, 8]
@@ -128,16 +128,15 @@ def quantize_fp32_linear_to_int4(weight, groupsize: int = 128, inner_k_tiles=8, 
     in_features = weight.shape[1]
     device = "cpu"
 
-    fqn = "layer_name"
-    print(f"linear: {fqn}, in={in_features}, out={out_features}")
+    print(f"linear: {layer_name}, in={in_features}, out={out_features}")
 
     if not _check_linear_int4_k(in_features, groupsize, inner_k_tiles):
         if padding:
-            print(f"warning: {fqn} is padded to satisfy in_features % 1024 == 0")
+            print(f"warning: {layer_name} is padded to satisfy in_features % 1024 == 0")
             padded_in_features = find_multiple(in_features, 1024)
             weight = torch.nn.functional.pad(weight, pad=(0, padded_in_features - in_features))
         else:
-            print(f"warning: {fqn} is skipped, int4 requires that in_features is 32, 64, or is divisible by 1024, " +
+            print(f"warning: {layer_name} is skipped, int4 requires that in_features is 32, 64, or is divisible by 1024, " +
         "and that groupsize and inner_k_tiles*16 evenly divide into it")
             return
     weight_int4pack, scales_and_zeros = prepare_int4_weight_and_scales_and_zeros(

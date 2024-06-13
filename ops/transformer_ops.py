@@ -6,14 +6,36 @@ from typing import Dict, Optional, Tuple
 from .utils import build_kv_caches, build_attention_mask, remap_weights_if_needed, load_multiple_transformer_block_weights_and_remap
 from .rope import apply_rotary_emb, precompute_rope_constants
 
-def linear_int8(input, weight, scales):
+from quantization.utils_int4 import linear_forward_int4, find_multiple
+
+def linear_int8(input, weight, scales, original_shape=None):
     return torch.nn.functional.linear(input, weight.to(dtype=input.dtype)) * scales
+
+def linear_int4(input, weight, scales_and_zeros, original_shape, groupsize=128, padding=True):
+    input = input.to(torch.bfloat16)
+
+    out_features = original_shape[0]
+    in_features = original_shape[1]
+
+    origin_in_features = in_features
+
+    in_features = find_multiple(in_features, 1024)
+
+    assert out_features % 8 == 0, "require out_features % 8 == 0"
+    
+    # TODO: add behaviour if padding is needed (https://github.com/pytorch-labs/gpt-fast/blob/main/quantize.py#L483-L525)
+    if padding:
+        input = torch.nn.functional.pad(input, pad=(0, in_features - origin_in_features))
+    return linear_forward_int4(input, weight, scales_and_zeros, out_features, groupsize)
+
+#linear_quantized = linear_int8
+linear_quantized = linear_int4
 
 def embedding_matrix(inputs, weights):
     # https://pytorch.org/docs/stable/generated/torch.nn.functional.embedding.html
     return torch.nn.functional.embedding(inputs, weights)
 
-@torch.jit.script
+#@torch.jit.script
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This function is taken from https://github.com/meta-llama/llama3/blob/main/llama/model.py
@@ -21,7 +43,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     bs, slen, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
-        return x
+        return xß
     return (
         x[:, :, :, None, :]
         .expand(bs, slen, n_kv_heads, n_rep, head_dim)
@@ -29,7 +51,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 @torch.inference_mode()
-@torch.jit.script
+#@torch.jit.script
 def functional_ffn(x: torch.Tensor, weights: Dict[str, torch.Tensor]):
     output = torch.nn.functional.linear(x, weights["mlp.gate_proj.weight"])
     output = torch.nn.functional.silu(output) * torch.nn.functional.linear(x, weights["mlp.up_proj.weight"])
@@ -37,11 +59,11 @@ def functional_ffn(x: torch.Tensor, weights: Dict[str, torch.Tensor]):
     return output
 
 @torch.inference_mode()
-@torch.jit.script
-def functional_ffn_int8(x: torch.Tensor, weights: Dict[str, torch.Tensor]):
-    output = linear_int8(x, weights["mlp.gate_proj.weight"], weights["mlp.gate_proj.weight_scales"])
-    output = torch.nn.functional.silu(output) * linear_int8(x, weights["mlp.up_proj.weight"], weights["mlp.up_proj.weight_scales"])
-    output = linear_int8(output, weights["mlp.down_proj.weight"], weights["mlp.down_proj.weight_scales"])
+#@torch.jit.script
+def functional_ffn_quantized(x: torch.Tensor, weights: Dict[str, torch.Tensor]):
+    output = linear_quantized(x, weights["mlp.gate_proj.weight"], weights["mlp.gate_proj.weight_scales"], weights["mlp.gate_proj.weight_orig_shape"])
+    output = torch.nn.functional.silu(output) * linear_quantized(x, weights["mlp.up_proj.weight"], weights["mlp.up_proj.weight_scales"], weights["mlp.up_proj.weight_orig_shape"])
+    output = linear_quantized(output, weights["mlp.down_proj.weight"], weights["mlp.down_proj.weight_scales"], weights["mlp.down_proj.weight_orig_shape"])
     return output
 
 def _normalization(inputs: torch.Tensor, eps:float = 1e-5) -> torch.Tensor:
@@ -51,7 +73,7 @@ def _normalization(inputs: torch.Tensor, eps:float = 1e-5) -> torch.Tensor:
     return rms_a
 
 @torch.inference_mode()
-@torch.jit.script
+#@torch.jit.script
 def functional_rmsnorm(inputs: torch.Tensor, weights: torch.Tensor, eps:float = 1e-5) -> torch.Tensor:
     """
     Root Mean Square Layer Normalization:
@@ -65,7 +87,7 @@ def functional_rmsnorm(inputs: torch.Tensor, weights: torch.Tensor, eps:float = 
     return output * weights
 
 @torch.inference_mode()
-#@torch.jit.script
+##@torch.jit.script
 def functional_gqa(
         x: torch.Tensor, 
         start_pos: int, 
@@ -142,8 +164,8 @@ def functional_gqa(
     return output
 
 @torch.inference_mode()
-#@torch.jit.script
-def functional_gqa_int8(
+##@torch.jit.script
+def functional_gqa_quantized(
         x: torch.Tensor, 
         start_pos: int, 
         weights: Dict[str, torch.Tensor], 
@@ -160,10 +182,10 @@ def functional_gqa_int8(
     
     # Apply attention transformation matrices
     # (BS, S, dim) -> (BS, S, n_heads * head_dim)
-    xq = linear_int8(x, weights["self_attn.q_proj.weight"], weights["self_attn.q_proj.weight_scales"])
+    xq = linear_quantized(x, weights["self_attn.q_proj.weight"], weights["self_attn.q_proj.weight_scales"], weights["self_attn.q_proj.weight_orig_shape"])
     # (BS, S, dim) -> (BS, S, n_kv_heads * head_dim)
-    xk = linear_int8(x, weights["self_attn.k_proj.weight"], weights["self_attn.k_proj.weight_scales"])
-    xv = linear_int8(x, weights["self_attn.v_proj.weight"], weights["self_attn.v_proj.weight_scales"])
+    xk = linear_quantized(x, weights["self_attn.k_proj.weight"], weights["self_attn.k_proj.weight_scales"], weights["self_attn.k_proj.weight_orig_shape"])
+    xv = linear_quantized(x, weights["self_attn.v_proj.weight"], weights["self_attn.v_proj.weight_scales"], weights["self_attn.v_proj.weight_orig_shape"])
 
     # Reshapes
     # (BS, S, n_heads * head_dim) -> (BS, S, n_heads, head_dim)
@@ -215,7 +237,7 @@ def functional_gqa_int8(
     output = torch.nn.functional.scaled_dot_product_attention(xq, keys, values, attn_mask=mask, dropout_p=0.0)
     # # (BS, n_heads, S, head_dim) -> (BS, S, n_heads, head_dim) -> (BS, S, n_heads * head_dim)
     output = output.transpose(1, 2).contiguous().view(bs, seq_len, -1)
-    output = linear_int8(output, weights["self_attn.o_proj.weight"], weights["self_attn.o_proj.weight_scales"])
+    output = linear_quantized(output, weights["self_attn.o_proj.weight"], weights["self_attn.o_proj.weight_scales"], weights["self_attn.o_proj.weight_orig_shape"])
     return output
 
 def functional_transformer_block(x: torch.Tensor, weights, cache_k, cache_v, start_pos: int, freqs_rope: torch.Tensor, config, mask: Optional[torch.Tensor]):
@@ -227,29 +249,30 @@ def functional_transformer_block(x: torch.Tensor, weights, cache_k, cache_v, sta
 
     attended_x = functional_rmsnorm(x, weights["input_layernorm.weight"])
     #hidden = x + functional_gqa(attended_x, start_pos, weights, cache_k, cache_v, freqs_rope, n_rep, n_kv_heads, n_heads, head_dim, mask)
-    hidden = x + functional_gqa_int8(attended_x, start_pos, weights, cache_k, cache_v, freqs_rope, n_rep, n_kv_heads, n_heads, head_dim, mask)
+    hidden = x + functional_gqa_quantized(attended_x, start_pos, weights, cache_k, cache_v, freqs_rope, n_rep, n_kv_heads, n_heads, head_dim, mask)
     attended_hidden = functional_rmsnorm(hidden, weights["post_attention_layernorm.weight"])
     #output = hidden + functional_ffn(attended_hidden, weights)
-    output = hidden + functional_ffn_int8(attended_hidden, weights)
+    output = hidden + functional_ffn_quantized(attended_hidden, weights)
     return output
 
 import time
 
 import pickle
 def load_block_chunk(block_chunk_idx):
-    with open(f'LLAMA3-8B-PKL-INT8/blocks_chunk_{block_chunk_idx}.pkl', 'rb') as handle:
+    with open(f'LLAMA3-8B-PKL-int4/blocks_chunk_{block_chunk_idx}.pkl', 'rb') as handle:
         b = pickle.load(handle)
     return b
 
 def load_general_chunk():
-    with open(f'LLAMA3-8B-PKL-INT8/general_chunk.pkl', 'rb') as handle:
+    with open(f'LLAMA3-8B-PKL-int4/general_chunk.pkl', 'rb') as handle:
         b = pickle.load(handle)
     return b
 
 def move_to_device(block_chunk, device):
     for layer_idx in block_chunk.keys():
         for layer_name in block_chunk[layer_idx].keys():
-            block_chunk[layer_idx][layer_name] = block_chunk[layer_idx][layer_name].to(device)
+            if not layer_name.endswith("_orig_shape"):
+                block_chunk[layer_idx][layer_name] = block_chunk[layer_idx][layer_name].to(device)
 
 class Transformer:
     def __init__(self, config, parser, device="cpu", preload_n_transformer_blocks = 16):
@@ -278,6 +301,7 @@ class Transformer:
         self.general_chunk_weights = load_general_chunk()
         self.output_embedding_weights = self.general_chunk_weights['lm_head.weight'].to(self.device)
         self.output_embedding_scales = self.general_chunk_weights['lm_head.weight_scales'].to(self.device)
+        self.output_embedding_orig_shape = self.general_chunk_weights['lm_head.weight_orig_shape']
 
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
@@ -320,5 +344,5 @@ class Transformer:
             #del block_weights
             
         h = functional_rmsnorm(h, self.output_norm_weights)
-        output = linear_int8(h, self.output_embedding_weights, self.output_embedding_scales).float()
+        output = linear_quantized(h, self.output_embedding_weights, self.output_embedding_scales, self.output_embedding_orig_shape).float()
         return output
