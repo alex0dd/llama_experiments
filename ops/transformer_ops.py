@@ -260,11 +260,13 @@ import time
 import pickle
 def load_block_chunk(block_chunk_idx):
     with open(f'LLAMA3-8B-PKL-int4/blocks_chunk_{block_chunk_idx}.pkl', 'rb') as handle:
+    #with open(f'LLAMA3-8B-PKL-int8/blocks_chunk_{block_chunk_idx}.pkl', 'rb') as handle:
         b = pickle.load(handle)
     return b
 
 def load_general_chunk():
     with open(f'LLAMA3-8B-PKL-int4/general_chunk.pkl', 'rb') as handle:
+    #with open(f'LLAMA3-8B-PKL-int8/general_chunk.pkl', 'rb') as handle:
         b = pickle.load(handle)
     return b
 
