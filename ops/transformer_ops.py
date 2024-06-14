@@ -8,11 +8,15 @@ from .rope import apply_rotary_emb, precompute_rope_constants
 
 from quantization.utils_int4 import linear_forward_int4, find_multiple
 
-def linear_int8(input, weight, scales, original_shape=None):
-    return torch.nn.functional.linear(input, weight.to(dtype=input.dtype)) * scales
+def linear_int8(inputs, weight, scales, original_shape=None):
+    return torch.nn.functional.linear(inputs, weight.to(dtype=inputs.dtype)) * scales
 
-def linear_int4(input, weight, scales_and_zeros, original_shape, groupsize=128, padding=True):
-    input = input.to(torch.bfloat16)
+def embedding_int8(inputs, weights, scales, original_shape=None):
+    embs = torch.nn.functional.embedding(inputs, weights)
+    return embs * scales #torch.embedding(input, weight) * scales
+
+def linear_int4(inputs, weight, scales_and_zeros, original_shape, groupsize=128, padding=True):
+    inputs = inputs.to(torch.bfloat16)
 
     out_features = original_shape[0]
     in_features = original_shape[1]
@@ -25,15 +29,18 @@ def linear_int4(input, weight, scales_and_zeros, original_shape, groupsize=128, 
     
     # TODO: add behaviour if padding is needed (https://github.com/pytorch-labs/gpt-fast/blob/main/quantize.py#L483-L525)
     if padding:
-        input = torch.nn.functional.pad(input, pad=(0, in_features - origin_in_features))
-    return linear_forward_int4(input, weight, scales_and_zeros, out_features, groupsize)
+        input = torch.nn.functional.pad(inputs, pad=(0, in_features - origin_in_features))
+    return linear_forward_int4(inputs, weight, scales_and_zeros, out_features, groupsize)
 
-#linear_quantized = linear_int8
-linear_quantized = linear_int4
-
-def embedding_matrix(inputs, weights):
+def embedding_matrix(inputs, weights, scales=None, original_shape=None):
     # https://pytorch.org/docs/stable/generated/torch.nn.functional.embedding.html
     return torch.nn.functional.embedding(inputs, weights)
+
+linear_quantized = linear_int8
+#linear_quantized = linear_int4
+
+embedding_quantized = embedding_int8
+# embedding_quantized = embedding_matrix
 
 #@torch.jit.script
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -43,7 +50,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     bs, slen, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
-        return xß
+        return x
     return (
         x[:, :, :, None, :]
         .expand(bs, slen, n_kv_heads, n_rep, head_dim)
@@ -259,14 +266,14 @@ import time
 
 import pickle
 def load_block_chunk(block_chunk_idx):
-    with open(f'LLAMA3-8B-PKL-int4/blocks_chunk_{block_chunk_idx}.pkl', 'rb') as handle:
-    #with open(f'LLAMA3-8B-PKL-int8/blocks_chunk_{block_chunk_idx}.pkl', 'rb') as handle:
+    #with open(f'LLAMA3-8B-PKL-int4/blocks_chunk_{block_chunk_idx}.pkl', 'rb') as handle:
+    with open(f'LLAMA3-8B-PKL-int8/blocks_chunk_{block_chunk_idx}.pkl', 'rb') as handle:
         b = pickle.load(handle)
     return b
 
 def load_general_chunk():
-    with open(f'LLAMA3-8B-PKL-int4/general_chunk.pkl', 'rb') as handle:
-    #with open(f'LLAMA3-8B-PKL-int8/general_chunk.pkl', 'rb') as handle:
+    #with open(f'LLAMA3-8B-PKL-int4/general_chunk.pkl', 'rb') as handle:
+    with open(f'LLAMA3-8B-PKL-int8/general_chunk.pkl', 'rb') as handle:
         b = pickle.load(handle)
     return b
 
@@ -290,14 +297,7 @@ class Transformer:
         self.parser = parser
         self.caches_memory = build_kv_caches(config, device=self.device)
 
-        self.embedding_weights = parser.get_tensor('model.embed_tokens.weight').to(self.device)
-        if config["tie_word_embeddings"]:
-            self.output_embedding_weights = self.embedding_weights
-        #else:
-        #    self.output_embedding_weights = parser.get_tensor('lm_head.weight')
-        #self.output_embedding_weights = self.output_embedding_weights.to(self.device)
-        self.output_norm_weights = parser.get_tensor('model.norm.weight').to(self.device)
-
+        # TODO: to support original precision models, for each weight add a dummy entry for "*_scales" and "orig_shapes" keys, and None value.
         self.chunk_weights = load_block_chunk(0) # assume all weights are in single chunk
         move_to_device(self.chunk_weights, self.device)
         self.general_chunk_weights = load_general_chunk()
@@ -305,10 +305,25 @@ class Transformer:
         self.output_embedding_scales = self.general_chunk_weights['lm_head.weight_scales'].to(self.device)
         self.output_embedding_orig_shape = self.general_chunk_weights['lm_head.weight_orig_shape']
 
+        #self.embedding_weights = parser.get_tensor('model.embed_tokens.weight').to(self.device)
+        
+        self.embedding_weights = self.general_chunk_weights['model.embed_tokens.weight'].to(self.device)
+        if 'model.embed_tokens.weight_scales' in self.general_chunk_weights:
+            self.embedding_weights_scales = self.general_chunk_weights['model.embed_tokens.weight_scales'].to(self.device)
+        else:
+            self.embedding_weights_scales = None
+        # TODO: fix this behavior
+        if config["tie_word_embeddings"]:
+            self.output_embedding_weights = self.embedding_weights
+        #else:
+        #    self.output_embedding_weights = parser.get_tensor('lm_head.weight')
+        #self.output_embedding_weights = self.output_embedding_weights.to(self.device)
+        self.output_norm_weights = parser.get_tensor('model.norm.weight').to(self.device)
+
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
         seq_len = tokens.shape[-1]
-        seq_embeddings = embedding_matrix(tokens, self.embedding_weights)
+        seq_embeddings = embedding_quantized(tokens, self.embedding_weights, self.embedding_weights_scales)
         freqs_rope = self.freqs_rope[start_pos : start_pos + seq_len]
         mask = build_attention_mask(seq_len, start_pos, device=tokens.device, dtype=seq_embeddings.dtype)
         h = seq_embeddings

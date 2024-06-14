@@ -133,16 +133,18 @@ embedding_weights = model_parser.get_tensor('model.embed_tokens.weight')
 output_norm_weights = model_parser.get_tensor('model.norm.weight')
 if quantization_type:
     output_embedding_weights = model_parser.get_tensor('lm_head.weight')
-    
 
 general_chunk_dict = {
-    'model.embed_tokens.weight': embedding_weights.to(device),
     'model.norm.weight': output_norm_weights.to(device),
 }
 if quantization_type:
     orig_shapes = output_embedding_weights.shape
     if quantization_type == "int8":
         output_embedding_weights, output_embedding_scales = quantize_fp32_linear_to_int8(output_embedding_weights)
+        # Embed also input embeddings
+        embedding_weights, embedding_scales = quantize_fp32_linear_to_int8(embedding_weights.T) # pay attention to transpose here
+        general_chunk_dict['model.embed_tokens.weight'] = embedding_weights.T.to(device)
+        general_chunk_dict['model.embed_tokens.weight_scales'] = embedding_scales.to(device)
     elif quantization_type == "int4":
         output_embedding_weights, output_embedding_scales = quantize_fp32_linear_to_int4(output_embedding_weights, quantization_type, device=device)
     general_chunk_dict['lm_head.weight'] = output_embedding_weights.to(device)
@@ -150,6 +152,7 @@ if quantization_type:
     general_chunk_dict['lm_head.weight_orig_shape'] = orig_shapes
 else:
     general_chunk_dict['lm_head.weight'] = output_embedding_weights.to(device)
+    general_chunk_dict['model.embed_tokens.weight'] = embedding_weights.to(device)
 
 with open(os.path.join(converted_model_path, f"general_chunk.pkl"), "wb") as f:
     pickle.dump(general_chunk_dict, f)
