@@ -8,6 +8,10 @@ conda activate llama_exploration
 pip install -r requirements.txt
 ```
 
+```
+python -m cProfile -s time run_model.py > profile.text 2>&1
+```
+
 Safetensors format: https://huggingface.co/docs/safetensors/index
 BF16: https://www.johndcook.com/blog/2018/11/15/bfloat16/
 
