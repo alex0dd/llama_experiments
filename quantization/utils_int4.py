@@ -184,6 +184,25 @@ def quantize_pack_embedding_table(embedding_table, group_size=32):
     packed_embedding_table_q = pack_4bit_u8_last_dim(embedding_table_q)
     return packed_embedding_table_q, embedding_table_zero_points, embedding_table_scales
 
+
+from .utils import _dynamically_quantize_per_channel
+def pack_4bit_int8_last_dim(W_q: Tensor) -> Tensor:  # int8 > int8/2
+    W_q = W_q.to(torch.int8)
+    _step = int(W_q.shape[-1] / 2)
+    return (W_q[..., :_step] << 4) | W_q[..., _step:]
+
+def unpack_4bit_int8_last_dim(W_q: Tensor, dtype=torch.int8) -> Tensor:  # int8/2 > int8
+    _step = W_q.shape[-1]
+    tmp = torch.empty(list(W_q.shape)[:-1] + [2 * _step], dtype=dtype, device=W_q.device)
+    tmp[..., :_step] = (W_q & 0b11110000) >> 4
+    tmp[..., _step:] = W_q & 0b00001111
+    return tmp
+
+def quantize_pack_embedding_table_v2(embedding_table):
+    int4_weight, scales, _ = _dynamically_quantize_per_channel(embedding_table.T.float(), -8, 7, torch.int8)
+    int4_weight = pack_4bit_int8_last_dim(int4_weight.T)
+    return int4_weight, scales
+
 def lookup_on_quantized_and_packed_embedding_table(indices, embedding_table_q_p, embedding_table_zero_points, embedding_table_scales):
     indices_shape = list(indices.size())
     weights_shape = list(embedding_table_q_p.size()[1:])

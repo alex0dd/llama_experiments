@@ -6,7 +6,7 @@ from typing import Dict, Optional, Tuple
 from .utils import build_kv_caches, build_attention_mask, remap_weights_if_needed, load_multiple_transformer_block_weights_and_remap
 from .rope import apply_rotary_emb, precompute_rope_constants
 
-from quantization.utils_int4 import linear_forward_int4, find_multiple, lookup_on_quantized_and_packed_embedding_table
+from quantization.utils_int4 import linear_forward_int4, find_multiple, unpack_4bit_int8_last_dim
 
 # TODO: clean this file and refactor
 # TODO: make RMSNorm's weights int8 quantizable
@@ -18,9 +18,14 @@ def embedding_int8(inputs, weights, scales, original_shape=None):
     embs = torch.nn.functional.embedding(inputs, weights)
     return embs * scales #torch.embedding(input, weight) * scales
 
-def embedding_int4(inputs, weights, zeros, scales):
-    embs = lookup_on_quantized_and_packed_embedding_table(inputs, weights, zeros, scales)
-    return embs
+def embedding_int4(inputs, weights, scales, original_shape=None):
+    embs = torch.nn.functional.embedding(inputs, weights)
+    orig_device = embs.device
+    embs = unpack_4bit_int8_last_dim(embs.to("cpu")).to(device=orig_device)
+    out = embs * scales
+    # TODO: fix this dtype hardcoding
+    out = out.to(torch.bfloat16)
+    return out
 
 
 def linear_int4(inputs, weight, scales_and_zeros, original_shape, groupsize=128, padding=True):
@@ -272,16 +277,11 @@ class Transformer:
         self.general_chunk_weights = load_general_chunk(model_dir)
         
         # TODO: simplify this behavior (tie embeddings + scales/shapes assigning)
-        """
         self.embedding_weights = self.general_chunk_weights['model.embed_tokens.weight'].to(self.device)
         if 'model.embed_tokens.weight_scales' in self.general_chunk_weights:
             self.embedding_weights_scales = self.general_chunk_weights['model.embed_tokens.weight_scales'].to(self.device)
         else:
             self.embedding_weights_scales = None
-        """
-        self.embedding_weights = self.general_chunk_weights['model.embed_tokens.weight'].to(self.device)
-        self.embedding_zeros = self.general_chunk_weights['model.embed_tokens.weight_zeros'].to(self.device)
-        self.embedding_scales = self.general_chunk_weights['model.embed_tokens.weight_scales'].to(self.device)
         
         if config["tie_word_embeddings"]:
             self.output_embedding_weights = self.embedding_weights
@@ -301,8 +301,7 @@ class Transformer:
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
         seq_len = tokens.shape[-1]
-        #seq_embeddings = embedding_quantized(tokens, self.embedding_weights, self.embedding_weights_scales)
-        seq_embeddings = embedding_quantized(tokens, self.embedding_weights, self.embedding_zeros, self.embedding_scales)
+        seq_embeddings = embedding_quantized(tokens, self.embedding_weights, self.embedding_weights_scales)
         freqs_rope = self.freqs_rope[start_pos : start_pos + seq_len]
         mask = build_attention_mask(seq_len, start_pos, device=tokens.device, dtype=seq_embeddings.dtype)
         h = seq_embeddings

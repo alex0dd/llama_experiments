@@ -10,7 +10,7 @@ import time
 import os
 
 from ops.utils import load_multiple_transformer_block_weights_and_remap
-from quantization.utils_int4 import quantize_fp32_linear_to_int4, quantize_pack_embedding_table
+from quantization.utils_int4 import quantize_fp32_linear_to_int4, quantize_pack_embedding_table_v2
 from quantization.utils_int8 import quantize_fp32_linear_to_int8
 
 def is_linear_weight(layer_name):
@@ -150,9 +150,8 @@ if quantization_type:
     # Embed also input embeddings (by default use int8 now, as int4 is still tricky)
     #embedding_weights, embedding_scales = quantize_fp32_linear_to_int8(embedding_weights.T) # pay attention to transpose here
     # Int4 group quantize and pack convert
-    embedding_weights, embedding_zeros, embedding_scales = quantize_pack_embedding_table(embedding_weights)
+    embedding_weights, embedding_scales = quantize_pack_embedding_table_v2(embedding_weights)
     general_chunk_dict['model.embed_tokens.weight'] = embedding_weights.to(device)
-    general_chunk_dict['model.embed_tokens.weight_zeros'] = embedding_zeros.to(device)
     general_chunk_dict['model.embed_tokens.weight_scales'] = embedding_scales.to(device)
 else:
     general_chunk_dict['lm_head.weight'] = output_embedding_weights.to(device)
