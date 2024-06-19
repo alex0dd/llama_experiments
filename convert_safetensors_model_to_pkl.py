@@ -148,10 +148,10 @@ if quantization_type:
     general_chunk_dict['lm_head.weight_orig_shape'] = orig_shapes
 
     # Embed also input embeddings (by default use int8 now, as int4 is still tricky)
-    #embedding_weights, embedding_scales = quantize_fp32_linear_to_int8(embedding_weights.T) # pay attention to transpose here
-    # Int4 group quantize and pack convert
-    embedding_weights, embedding_scales = quantize_pack_embedding_table_v2(embedding_weights)
-    general_chunk_dict['model.embed_tokens.weight'] = embedding_weights.to(device)
+    embedding_weights, embedding_scales = quantize_fp32_linear_to_int8(embedding_weights.T) # pay attention to transpose here
+    # Int4 quantize and pack convert
+    #embedding_weights, embedding_scales = quantize_pack_embedding_table_v2(embedding_weights)
+    general_chunk_dict['model.embed_tokens.weight'] = embedding_weights.T.to(device)
     general_chunk_dict['model.embed_tokens.weight_scales'] = embedding_scales.to(device)
 else:
     general_chunk_dict['lm_head.weight'] = output_embedding_weights.to(device)

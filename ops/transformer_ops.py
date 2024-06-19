@@ -52,8 +52,8 @@ def embedding_matrix(inputs, weights, scales=None, original_shape=None):
 linear_quantized = linear_int8
 #linear_quantized = linear_int4
 
-embedding_quantized = embedding_int4
-# embedding_quantized = embedding_int8
+#embedding_quantized = embedding_int4
+embedding_quantized = embedding_int8
 # embedding_quantized = embedding_matrix
 
 #@torch.jit.script
