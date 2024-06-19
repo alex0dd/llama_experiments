@@ -245,7 +245,7 @@ def move_to_device(block_chunk, device):
                 block_chunk[layer_idx][layer_name] = block_chunk[layer_idx][layer_name].to(device)
 
 class Transformer:
-    def __init__(self, config, device="cpu", preload_n_transformer_blocks = 16):
+    def __init__(self, config, device="cpu"):
         model_dir = "LLAMA3-8B-PKL-int8"
         self.device=device
         self.freqs_rope = precompute_rope_constants(
@@ -253,7 +253,6 @@ class Transformer:
             config["max_position_embeddings"] * 2,
             config["rope_theta"],
         ).to(self.device)
-        self.preload_n_transformer_blocks = preload_n_transformer_blocks
         self.config = config
         self.num_layers = config["num_hidden_layers"]
         self.caches_memory = build_kv_caches(config, device=self.device)
