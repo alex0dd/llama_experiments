@@ -111,6 +111,9 @@ def build_attention_mask(seq_len, start_pos, device, dtype):
     if seq_len > 1:
         mask = torch.full((seq_len, seq_len), float("-inf"), device=device)
         mask = torch.triu(mask, diagonal=1)
+        if device.type == "mps":
+            # https://github.com/pytorch/pytorch/issues/100005
+            mask = torch.nan_to_num(mask, nan=0.0)
         # When performing key-value caching, we compute the attention scores
         # only for the new sequence. Thus, the matrix of scores is of size
         # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for

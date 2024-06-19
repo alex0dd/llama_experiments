@@ -169,7 +169,6 @@ def functional_gqa_quantized(
         mask: Optional[torch.Tensor]
     ):
     bs, seq_len, _ = x.shape
-    
     # Apply attention transformation matrices
     # (BS, S, dim) -> (BS, S, n_heads * head_dim)
     xq = linear_quantized(x, weights["self_attn.q_proj.weight"], weights["self_attn.q_proj.weight_scales"], weights["self_attn.q_proj.weight_orig_shape"])
@@ -200,13 +199,11 @@ def functional_gqa_quantized(
     else:
         # TODO: check if sequence length here is correct, given we start from pos=0
         values = xv
-
     # Pad keys and values from n_kv_heads to n_heads, if needed (if n_kv_heads < n_heads)
     keys = repeat_kv(keys, n_rep)  # (BS, cache_len + S, n_heads, head_dim)
     values = repeat_kv(values, n_rep)  # (BS, cache_len + S, n_heads, head_dim)
 
     xq, keys, values = map(lambda x: x.transpose(1, 2), (xq, keys, values))
-
     output = torch.nn.functional.scaled_dot_product_attention(xq, keys, values, attn_mask=mask, dropout_p=0.0)
     # # (BS, n_heads, S, head_dim) -> (BS, S, n_heads, head_dim) -> (BS, S, n_heads * head_dim)
     output = output.transpose(1, 2).contiguous().view(bs, seq_len, -1)
@@ -282,10 +279,10 @@ class Transformer:
                 self.output_embedding_scales = self.general_chunk_weights['lm_head.weight_scales'].to(self.device)
             else:
                 self.output_embedding_scales = None
-            #if 'lm_head.weight_orig_shape' in self.general_chunk_weights:
-            #    self.output_embedding_orig_shape = self.general_chunk_weights['lm_head.weight_orig_shape']
-            #else:
-            #    self.output_embedding_orig_shape = None
+            if 'lm_head.weight_orig_shape' in self.general_chunk_weights:
+                self.output_embedding_orig_shape = self.general_chunk_weights['lm_head.weight_orig_shape']
+            else:
+                self.output_embedding_orig_shape = None
         self.output_norm_weights = self.general_chunk_weights['model.norm.weight'].to(self.device)
 
     @torch.inference_mode()
