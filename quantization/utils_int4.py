@@ -91,6 +91,7 @@ def group_quantize_tensor(w, n_bit=4, groupsize=128):
 ##### weight only int4 per channel groupwise quantized code ######
 
 def prepare_int4_weight_and_scales_and_zeros(weight_bf16, groupsize, inner_k_tiles):
+    # https://github.com/pytorch/pytorch/blob/5ffb032be682a34b959c82ce289b457ea6c6e504/aten/src/ATen/native/LinearAlgebra.cpp#L3476
     weight_int32, scales_and_zeros = group_quantize_tensor(
         weight_bf16, n_bit=4, groupsize=groupsize
     )
