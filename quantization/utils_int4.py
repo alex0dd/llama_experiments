@@ -1,4 +1,5 @@
 import torch
+from .utils import group_quantize_round_to_nearest, group_dequantize
 
 """
 Based on:
@@ -143,3 +144,65 @@ def quantize_fp32_linear_to_int4(weight, layer_name, groupsize: int = 128, inner
         weight.to(torch.bfloat16).to(device=device), groupsize, inner_k_tiles
     )
     return weight_int4pack, scales_and_zeros
+
+########
+# Adaptation of functions from https://github.com/mobiusml/hqq/
+########
+
+# 4-bit
+################################################
+from torch import Tensor, uint8
+
+def pack_4bit_u8_last_dim(W_q: Tensor) -> Tensor:  # uint8 > uint8/2
+    W_q = W_q.to(uint8)
+    _step = int(W_q.shape[-1] / 2)
+
+    return (W_q[..., :_step] << 4) | W_q[..., _step:]
+
+@staticmethod
+def unpack_4bit_u8_last_dim(W_q: Tensor, dtype=uint8) -> Tensor:  # uint8/2 > uint8
+    _step = W_q.shape[-1]
+    tmp = torch.empty(list(W_q.shape)[:-1] + [2 * _step], dtype=dtype, device=W_q.device)
+
+    tmp[..., :_step] = (W_q & 0b11110000) >> 4
+    tmp[..., _step:] = W_q & 0b00001111
+
+    return tmp
+
+"""
+Layers operations
+"""
+
+def quantize_pack_embedding_table(embedding_table, group_size=32):
+    """
+    Quantizes an embedding table by taking groups on each row and packs the 4bit integers into a single byte.
+    At inference time, the looked up indices will yield a very small portion of this quantized and packed table.
+    """
+    n_bits = 4
+    # TODO: check if we can use here the quantization function from int8, which doesn't return zeros but only scales
+    embedding_table_q, embedding_table_zero_points, embedding_table_scales = group_quantize_round_to_nearest(embedding_table, bits=n_bits, group_size=group_size)
+    packed_embedding_table_q = pack_4bit_u8_last_dim(embedding_table_q)
+    return packed_embedding_table_q, embedding_table_zero_points, embedding_table_scales
+
+def lookup_on_quantized_and_packed_embedding_table(indices, embedding_table_q_p, embedding_table_zero_points, embedding_table_scales):
+    indices_shape = list(indices.size())
+    weights_shape = list(embedding_table_q_p.size()[1:])
+
+    zeros_shape = list(embedding_table_zero_points.size()[1:])
+    scales_shape = list(embedding_table_scales.size()[1:])
+    # Selects rows using flattened indices, and reshapes to (B, S, Group, Hidden//Group//packing_factor)
+    selected_rows = torch.index_select(embedding_table_q_p, 0, indices.reshape(-1)).view(indices_shape + weights_shape)
+
+    selected_zeros = torch.index_select(embedding_table_zero_points, 0, indices.reshape(-1)).view(indices_shape + zeros_shape)
+    selected_scales = torch.index_select(embedding_table_scales, 0, indices.reshape(-1)).view(indices_shape + scales_shape)
+
+    # To avoid MPS error, we unpack on CPU
+    orig_device = selected_rows.device
+    selected_rows = unpack_4bit_u8_last_dim(selected_rows.to("cpu")).to(orig_device)
+
+    # Results in shape (B, S, Group, Hidden//Group)
+    embedding_weights_dequant = group_dequantize(selected_rows, selected_zeros, selected_scales)
+    # Reshape to (B, S, Hidden)
+    embedding_weights_dequant = embedding_weights_dequant.flatten(start_dim=-len(weights_shape))
+
+    return embedding_weights_dequant
