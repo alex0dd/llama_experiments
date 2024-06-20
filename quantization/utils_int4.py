@@ -225,3 +225,32 @@ def lookup_on_quantized_and_packed_embedding_table(indices, embedding_table_q_p,
     embedding_weights_dequant = embedding_weights_dequant.flatten(start_dim=-len(weights_shape))
 
     return embedding_weights_dequant
+
+### Layers
+
+def embedding_int4(inputs, weights, scales, original_shape=None):
+    embs = torch.nn.functional.embedding(inputs, weights)
+    orig_device = embs.device
+    embs = unpack_4bit_int8_last_dim(embs.to("cpu")).to(device=orig_device)
+    out = embs * scales
+    # TODO: fix this dtype hardcoding
+    out = out.to(torch.bfloat16)
+    return out
+
+
+def linear_int4(inputs, weight, scales_and_zeros, original_shape, groupsize=128, padding=True):
+    inputs = inputs.to(torch.bfloat16)
+
+    out_features = original_shape[0]
+    in_features = original_shape[1]
+
+    origin_in_features = in_features
+
+    in_features = find_multiple(in_features, 1024)
+
+    assert out_features % 8 == 0, "require out_features % 8 == 0"
+    
+    # TODO: add behaviour if padding is needed (https://github.com/pytorch-labs/gpt-fast/blob/main/quantize.py#L483-L525)
+    if padding:
+        input = torch.nn.functional.pad(inputs, pad=(0, in_features - origin_in_features))
+    return linear_forward_int4(inputs, weight, scales_and_zeros, out_features, groupsize)

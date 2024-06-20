@@ -4,6 +4,18 @@ from collections import defaultdict
 
 from typing import Dict
 
+import pickle
+
+def load_block_chunk(model_dir, block_chunk_idx):
+    with open(f'{model_dir}/blocks_chunk_{block_chunk_idx}.pkl', 'rb') as handle:
+        b = pickle.load(handle)
+    return b
+
+def load_general_chunk(model_dir):
+    with open(f'{model_dir}/general_chunk.pkl', 'rb') as handle:
+        b = pickle.load(handle)
+    return b
+
 def hf_undo_permute(w: torch.Tensor, n_heads: int, dim1: int, dim2: int) -> torch.Tensor:
     return w.view(n_heads, 2, dim1 // n_heads // 2, dim2).transpose(1, 2).reshape(dim1, dim2)
 
@@ -122,3 +134,17 @@ def build_attention_mask(seq_len, start_pos, device, dtype):
             [torch.zeros((seq_len, start_pos), device=device), mask]
         ).to(dtype)
     return mask
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This function is taken from https://github.com/meta-llama/llama3/blob/main/llama/model.py
+    It should be equivalent to torch.repeat_interleave(x, dim=2, repeats=n_rep)
+    """
+    bs, slen, n_kv_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        x[:, :, :, None, :]
+        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
+        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+    )
