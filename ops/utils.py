@@ -2,7 +2,7 @@ import torch
 
 from collections import defaultdict
 
-from typing import Dict
+from typing import Dict, List
 
 import pickle
 
@@ -48,19 +48,30 @@ def remap_weights_if_needed(weights: torch.Tensor, param_name: str, config) -> t
         )
     return weights
 
-def get_all_layer_names_in_block(layer_idx: int) -> Dict[str, str]:
+def get_all_layer_names_in_block(layer_idx: int, config) -> Dict[str, str]:
     """
     Returns a dictionary with keys being layer names for a given transformer block
     in HF format and values being their mapping to be used within Transformer model.
     """
-    weight_remap = {
-        f'model.layers.{layer_idx}.mlp.down_proj.weight': 'mlp.down_proj.weight',
-        f'model.layers.{layer_idx}.mlp.gate_proj.weight': 'mlp.gate_proj.weight',
-        f'model.layers.{layer_idx}.mlp.up_proj.weight': 'mlp.up_proj.weight',
-        f'model.layers.{layer_idx}.input_layernorm.weight': 'input_layernorm.weight',
-        f'model.layers.{layer_idx}.post_attention_layernorm.weight': 'post_attention_layernorm.weight'
-    }
-    for letter in ['q', 'k', 'v', 'o']:
+    if config["model_type"] == "phi3":
+        attn_letters = ['o', 'qkv']
+        weight_remap = {
+            f'model.layers.{layer_idx}.mlp.down_proj.weight': 'mlp.down_proj.weight',
+            f'model.layers.{layer_idx}.mlp.gate_up_proj.weight': 'mlp.gate_up_proj.weight',
+            f'model.layers.{layer_idx}.input_layernorm.weight': 'input_layernorm.weight',
+            f'model.layers.{layer_idx}.post_attention_layernorm.weight': 'post_attention_layernorm.weight'
+        }
+    else:
+        attn_letters = ['q', 'k', 'v', 'o'] 
+        weight_remap = {
+            f'model.layers.{layer_idx}.mlp.down_proj.weight': 'mlp.down_proj.weight',
+            f'model.layers.{layer_idx}.mlp.gate_proj.weight': 'mlp.gate_proj.weight',
+            f'model.layers.{layer_idx}.mlp.up_proj.weight': 'mlp.up_proj.weight',
+            f'model.layers.{layer_idx}.input_layernorm.weight': 'input_layernorm.weight',
+            f'model.layers.{layer_idx}.post_attention_layernorm.weight': 'post_attention_layernorm.weight'
+        }
+    
+    for letter in attn_letters:
         orig_key = f'model.layers.{layer_idx}.self_attn.{letter}_proj.weight'
         new_key = f'self_attn.{letter}_proj.weight'
         weight_remap[orig_key] = new_key
@@ -77,7 +88,7 @@ def load_multiple_transformer_block_weights_and_remap(parser, config, layer_idxs
     # Get all the layer names
     for idx in layer_idxs:
         if idx < num_layers:
-            weight_remap = get_all_layer_names_in_block(idx)
+            weight_remap = get_all_layer_names_in_block(idx, config=config)
             all_weights_remap.update(weight_remap)
     # Load all weights opening the F files exactly F times.
     all_loaded_weights = parser.get_tensors(list(all_weights_remap.keys()))
@@ -105,13 +116,26 @@ def build_kv_caches(config, device, max_seq_len=2048, max_bs=4):
     Bytes per layer = 4194304 * 4 (assuming float) = 16777216 bytes (16MB per layer)
     Bytes per model = 16777216 * NUM_LAYERS = 16777216 * 32 = 536870912 (512MB per model)
     """
+    if "torch." not in config["torch_dtype"]: torch_dtype = "torch."+config["torch_dtype"]
+    else: torch_dtype = config["torch_dtype"]
+    # We need this, as pytorch can't build a type instance from string
+    dtype_map ={
+        "torch.bfloat16": torch.bfloat16,
+        "torch.int8": torch.int8,
+        "torch.uint8": torch.uint8,
+        "torch.float16": torch.float16,
+        "torch.half": torch.float16,
+        "torch.float": torch.float32,
+        "torch.float32": torch.float32,
+    }
+
     caches_memory = {}
     n_kv_heads = config["num_key_value_heads"]
     head_dim = config["hidden_size"] // config["num_attention_heads"]
     for layer_idx in range(config["num_hidden_layers"]):
         caches_memory[layer_idx] = {}
-        caches_memory[layer_idx]["k"] = torch.zeros((max_bs, max_seq_len, n_kv_heads, head_dim), dtype=config["torch_dtype"], device=device)
-        caches_memory[layer_idx]["v"] = torch.zeros((max_bs, max_seq_len, n_kv_heads, head_dim), dtype=config["torch_dtype"], device=device)
+        caches_memory[layer_idx]["k"] = torch.zeros((max_bs, max_seq_len, n_kv_heads, head_dim), dtype=dtype_map[torch_dtype], device=device)
+        caches_memory[layer_idx]["v"] = torch.zeros((max_bs, max_seq_len, n_kv_heads, head_dim), dtype=dtype_map[torch_dtype], device=device)
     return caches_memory
 
 @torch.inference_mode()

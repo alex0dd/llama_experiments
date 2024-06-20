@@ -2,7 +2,7 @@ import torch
 from typing import Dict, Optional
 
 from .utils import build_kv_caches, build_attention_mask, repeat_kv, load_block_chunk, load_general_chunk
-from .rope import apply_rotary_emb, precompute_rope_constants
+from .rope import LLAMA3_PositionalEmbeddings, Phi3_PositionalEmbeddings
 
 from quantization.utils_int4 import embedding_int4, linear_int4
 from quantization.utils_int8 import embedding_int8, linear_int8
@@ -32,6 +32,14 @@ def functional_ffn_quantized(x: torch.Tensor, weights: Dict[str, torch.Tensor]):
     output = linear_quantized(x, weights["mlp.gate_proj.weight"], weights["mlp.gate_proj.weight_scales"], weights["mlp.gate_proj.weight_orig_shape"])
     output = torch.nn.functional.silu(output) * linear_quantized(x, weights["mlp.up_proj.weight"], weights["mlp.up_proj.weight_scales"], weights["mlp.up_proj.weight_orig_shape"])
     output = linear_quantized(output, weights["mlp.down_proj.weight"], weights["mlp.down_proj.weight_scales"], weights["mlp.down_proj.weight_orig_shape"])
+    return output
+
+@torch.inference_mode()
+def functional_ffn_phi3_quantized(x: torch.Tensor, weights: Dict[str, torch.Tensor]):
+    up_states = linear_quantized(x, weights["mlp.gate_up_proj.weight"], weights["mlp.gate_up_proj.weight_scales"], weights["mlp.gate_up_proj.weight_orig_shape"])
+    gate, up_states = up_states.chunk(2, dim=-1)
+    up_states = torch.nn.functional.silu(gate) * up_states
+    output = linear_quantized(up_states, weights["mlp.down_proj.weight"], weights["mlp.down_proj.weight_scales"], weights["mlp.down_proj.weight_orig_shape"])
     return output
 
 def _normalization(inputs: torch.Tensor, eps:float = 1e-5) -> torch.Tensor:
@@ -65,7 +73,8 @@ def functional_gqa_quantized(
         n_kv_heads: int,
         n_heads: int,
         head_dim: int,
-        mask: Optional[torch.Tensor]
+        mask: Optional[torch.Tensor],
+        model_type: str,
     ):
     bs, seq_len, _ = x.shape
     # Apply attention transformation matrices
@@ -81,7 +90,10 @@ def functional_gqa_quantized(
     xk = xk.view(bs, seq_len, n_kv_heads, head_dim)
     xv = xv.view(bs, seq_len, n_kv_heads, head_dim)
     # Apply positional embeddings
-    xq, xk = apply_rotary_emb(xq, xk, freqs_rope)
+    if model_type == "phi3":
+        xq, xk = Phi3_PositionalEmbeddings.apply_rotary_emb(xq, xk, cos=freqs_rope[0], sin=freqs_rope[1])
+    else:
+        xq, xk = LLAMA3_PositionalEmbeddings.apply_rotary_emb(xq, xk, freqs_rope)
     # Populate KV cache
     if cache_k is not None:
         cache_k[:bs, start_pos : start_pos + seq_len] = xk
@@ -111,11 +123,15 @@ def functional_transformer_block(x: torch.Tensor, weights, cache_k, cache_v, sta
     n_kv_heads = config["num_key_value_heads"]
     n_heads = config["num_attention_heads"]
     head_dim = config["hidden_size"] // config["num_attention_heads"]
+    model_type = config["model_type"]
 
     attended_x = functional_rmsnorm(x, weights["input_layernorm.weight"])
-    hidden = x + functional_gqa_quantized(attended_x, start_pos, weights, cache_k, cache_v, freqs_rope, n_rep, n_kv_heads, n_heads, head_dim, mask)
+    hidden = x + functional_gqa_quantized(attended_x, start_pos, weights, cache_k, cache_v, freqs_rope, n_rep, n_kv_heads, n_heads, head_dim, mask, model_type)
     attended_hidden = functional_rmsnorm(hidden, weights["post_attention_layernorm.weight"])
-    output = hidden + functional_ffn_quantized(attended_hidden, weights)
+    if model_type == "phi3":
+        output = hidden + functional_ffn_phi3_quantized(attended_hidden, weights)
+    else:
+        output = hidden + functional_ffn_quantized(attended_hidden, weights)
     return output
 
 def move_to_device(block_chunk, device):
@@ -128,11 +144,15 @@ class Transformer:
     def __init__(self, model_dir, config, device="cpu"):
         model_dir = model_dir
         self.device=device
-        self.freqs_rope = precompute_rope_constants(
-            config["hidden_size"] // config["num_attention_heads"],
-            config["max_position_embeddings"] * 2,
-            config["rope_theta"],
-        ).to(self.device)
+        if config["model_type"] == "llama":
+            self.freqs_rope = LLAMA3_PositionalEmbeddings.precompute_rope_constants(
+                config["hidden_size"] // config["num_attention_heads"],
+                config["max_position_embeddings"] * 2,
+                config["rope_theta"],
+            ).to(self.device)
+        elif config["model_type"] == "phi3":
+            self.freqs_rope = None
+
         self.config = config
         self.max_seq_len = config["max_position_embeddings"]
         self.num_layers = config["num_hidden_layers"]
@@ -169,7 +189,19 @@ class Transformer:
     def forward(self, tokens: torch.Tensor, start_pos: int):
         seq_len = tokens.shape[-1]
         seq_embeddings = embedding_quantized(tokens, self.embedding_weights, self.embedding_weights_scales)
-        freqs_rope = self.freqs_rope[start_pos : start_pos + seq_len]
+        if self.config["model_type"] == "phi3":
+            position_ids = torch.arange(
+                start_pos, seq_len + start_pos, dtype=torch.long, device=self.device
+            )
+            position_ids = position_ids.unsqueeze(0).view(-1, seq_len)
+            freqs_rope = Phi3_PositionalEmbeddings.precompute_rope_constants(
+                seq_embeddings,
+                position_ids=position_ids,
+                dim=self.config["hidden_size"] // self.config["num_attention_heads"],
+                base=self.config["rope_theta"],
+            )#.to(self.device) # internally it'll automatically transfer to the device TODO: make phi3 embs return a tensor, not a tuple
+        else:
+            freqs_rope = self.freqs_rope[start_pos : start_pos + seq_len]
         mask = build_attention_mask(seq_len, start_pos, device=tokens.device, dtype=seq_embeddings.dtype)
         h = seq_embeddings
         for layer_idx in range(self.num_layers):

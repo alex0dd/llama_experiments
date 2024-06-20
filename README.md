@@ -13,7 +13,8 @@ python -m cProfile -s time run_model.py > profile.text 2>&1
 ```
 
 ```
-python convert_safetensors_model_to_pkl.py --quantization_type int8
+python convert_safetensors_llama3_model_to_pkl.py --quantization_type int8
+python convert_safetensors_phi3_model_to_pkl.py --quantization_type int8
 ```
 
 Safetensors format: https://huggingface.co/docs/safetensors/index
