@@ -1,5 +1,6 @@
 import math
 import struct
+import json
 
 import numpy as np
 try:
@@ -65,3 +66,8 @@ def load_tensor_from_memory(file_name, begin_pos, n_of_bytes):
 
 def deallocate_tensor(tensor):
     del tensor
+
+def load_json(file_path):
+    with open(file_path, 'r') as file:
+        config = json.load(file)
+    return config

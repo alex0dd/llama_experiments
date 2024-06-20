@@ -13,6 +13,8 @@ from ops.utils import load_multiple_transformer_block_weights_and_remap
 from quantization.utils_int4 import quantize_fp32_linear_to_int4, quantize_pack_embedding_table_v2
 from quantization.utils_int8 import quantize_fp32_linear_to_int8
 
+from utils.utils import load_json
+
 def is_linear_weight(layer_name):
     return "mlp." in layer_name and ".weight" in layer_name
 
@@ -65,41 +67,16 @@ print(args)
 quantization_type = args.quantization_type
 device = args.device
 
-model_parser = ModelParser([
-    "./Meta-Llama-3-8B/model-00001-of-00004.safetensors",
-    "./Meta-Llama-3-8B/model-00002-of-00004.safetensors",
-    "./Meta-Llama-3-8B/model-00003-of-00004.safetensors",
-    "./Meta-Llama-3-8B/model-00004-of-00004.safetensors",
-])
+base_model_dir = "Meta-Llama-3-8B"
 
-config = {
-  "architectures": [
-    "LlamaForCausalLM"
-  ],
-  "attention_bias": False,
-  "attention_dropout": 0.0,
-  "bos_token_id": 128000,
-  "eos_token_id": 128001,
-  "hidden_act": "silu",
-  "hidden_size": 4096,
-  "initializer_range": 0.02,
-  "intermediate_size": 14336,
-  #"max_position_embeddings": 8192,
-  "max_position_embeddings": 2048,
-  "model_type": "llama",
-  "num_attention_heads": 32,
-  "num_hidden_layers": 32,
-  "num_key_value_heads": 8,
-  "pretraining_tp": 1,
-  "rms_norm_eps": 1e-05,
-  "rope_scaling": None,
-  "rope_theta": 500000.0,
-  "tie_word_embeddings": False,
-  "torch_dtype": torch.bfloat16,
-  "transformers_version": "4.40.0.dev0",
-  "use_cache": True,
-  "vocab_size": 128256
-}
+model_parser = ModelParser([
+    f"./{base_model_dir}/model-00001-of-00004.safetensors",
+    f"./{base_model_dir}/model-00002-of-00004.safetensors",
+    f"./{base_model_dir}/model-00003-of-00004.safetensors",
+    f"./{base_model_dir}/model-00004-of-00004.safetensors",
+])
+config = load_json(f"./{base_model_dir}/config.json")
+config["max_position_embeddings"] = 2048
 
 converted_model_path = "LLAMA3-8B-PKL"+("" if not quantization_type else f"-{quantization_type}")
 
