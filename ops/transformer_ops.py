@@ -117,14 +117,16 @@ def functional_gqa_quantized(
         # TODO: check if sequence length here is correct, given we start from pos=0
         values = xv
     
+    if n_kv_heads < n_heads:
+        # Pad keys and values from n_kv_heads to n_heads, if needed (if n_kv_heads < n_heads)
+        keys = repeat_kv(keys, n_rep)  # (BS, cache_len + S, n_heads, head_dim)
+        values = repeat_kv(values, n_rep)  # (BS, cache_len + S, n_heads, head_dim)
+
     if xq.device.type == "mps":
         xq, keys, values = map(lambda x: x.transpose(1, 2), (xq, keys, values))
         output = base_attn(xq, keys, values, mask, head_dim)
         output = output.reshape(bs, seq_len, -1)
     else:
-        # Pad keys and values from n_kv_heads to n_heads, if needed (if n_kv_heads < n_heads)
-        keys = repeat_kv(keys, n_rep)  # (BS, cache_len + S, n_heads, head_dim)
-        values = repeat_kv(values, n_rep)  # (BS, cache_len + S, n_heads, head_dim)
         xq, keys, values = map(lambda x: x.transpose(1, 2), (xq, keys, values))
         output = torch.nn.functional.scaled_dot_product_attention(xq, keys, values, attn_mask=mask, dropout_p=0.0)
         # # (BS, n_heads, S, head_dim) -> (BS, S, n_heads, head_dim) -> (BS, S, n_heads * head_dim)
