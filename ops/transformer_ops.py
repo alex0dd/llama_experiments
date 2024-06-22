@@ -61,6 +61,15 @@ def functional_rmsnorm(inputs: torch.Tensor, weights: torch.Tensor, eps:float = 
     output = _normalization(inputs.float()).type_as(inputs)
     return output * weights
 
+def base_attn(q, k, v, mask, head_dim):
+    normalize_fact = float(head_dim)**-0.5
+    scores = (q * normalize_fact) @ k.transpose(3, 2)
+    if mask is not None:
+        scores = scores + mask
+    scores = torch.softmax(scores, axis=-1)
+    output = (scores @ v).transpose(2, 1)
+    return output
+
 @torch.inference_mode()
 def functional_gqa_quantized(
         x: torch.Tensor, 
@@ -107,13 +116,19 @@ def functional_gqa_quantized(
     else:
         # TODO: check if sequence length here is correct, given we start from pos=0
         values = xv
-    # Pad keys and values from n_kv_heads to n_heads, if needed (if n_kv_heads < n_heads)
-    keys = repeat_kv(keys, n_rep)  # (BS, cache_len + S, n_heads, head_dim)
-    values = repeat_kv(values, n_rep)  # (BS, cache_len + S, n_heads, head_dim)
-    xq, keys, values = map(lambda x: x.transpose(1, 2), (xq, keys, values))
-    output = torch.nn.functional.scaled_dot_product_attention(xq, keys, values, attn_mask=mask, dropout_p=0.0)
-    # # (BS, n_heads, S, head_dim) -> (BS, S, n_heads, head_dim) -> (BS, S, n_heads * head_dim)
-    output = output.transpose(1, 2).contiguous().view(bs, seq_len, -1)
+    
+    if xq.device.type == "mps":
+        xq, keys, values = map(lambda x: x.transpose(1, 2), (xq, keys, values))
+        output = base_attn(xq, keys, values, mask, head_dim)
+        output = output.reshape(bs, seq_len, -1)
+    else:
+        # Pad keys and values from n_kv_heads to n_heads, if needed (if n_kv_heads < n_heads)
+        keys = repeat_kv(keys, n_rep)  # (BS, cache_len + S, n_heads, head_dim)
+        values = repeat_kv(values, n_rep)  # (BS, cache_len + S, n_heads, head_dim)
+        xq, keys, values = map(lambda x: x.transpose(1, 2), (xq, keys, values))
+        output = torch.nn.functional.scaled_dot_product_attention(xq, keys, values, attn_mask=mask, dropout_p=0.0)
+        # # (BS, n_heads, S, head_dim) -> (BS, S, n_heads, head_dim) -> (BS, S, n_heads * head_dim)
+        output = output.transpose(1, 2).contiguous().view(bs, seq_len, -1)
     output = linear_quantized(output, weights["self_attn.o_proj.weight"], weights["self_attn.o_proj.weight_scales"], weights["self_attn.o_proj.weight_orig_shape"])
     return output
 
@@ -194,6 +209,9 @@ class Transformer:
 
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
+        # emb O(0.0001)s
+        # all blocks O(0.25)s
+        # head 0(0.0001)s
         seq_len = tokens.shape[-1]
         seq_embeddings = embedding_quantized(tokens, self.embedding_weights, self.embedding_weights_scales)
         if self.config["model_type"] == "phi3":
