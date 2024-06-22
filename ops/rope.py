@@ -23,11 +23,10 @@ class Phi3_PositionalEmbeddings:
         return torch.cat((-x2, x1), dim=-1)
     
     @torch.no_grad()
-    def precompute_rope_constants(x, position_ids, base, dim):
-        # x is needed only to get device info and dtype
+    def precompute_rope_constants(position_ids, base, dim):
         # x: [bs, num_attention_heads, seq_len, head_size]
         inv_freq = 1.0 / (
-            base ** (torch.arange(0, dim, 2, dtype=torch.int64, device=x.device).float() / dim)
+            base ** (torch.arange(0, dim, 2, dtype=torch.int64).float() / dim)
         )
         inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
@@ -37,11 +36,11 @@ class Phi3_PositionalEmbeddings:
         emb = torch.cat((freqs, freqs), dim=-1)
         cos = emb.cos()
         sin = emb.sin()
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+        return torch.cat([cos, sin])#.transpose(0, 1) # [2, seq_len, dim] -> [seq_len, 2, dim]
 
     @staticmethod
     # Copied from transformers.models.llama.modeling_llama.apply_rotary_pos_emb
-    def apply_rotary_emb(q, k, cos, sin, unsqueeze_dim=2):
+    def apply_rotary_emb(q, k, cos, sin, unsqueeze_dim=1):
         """Applies Rotary Position Embedding to the query and key tensors.
 
         Args:

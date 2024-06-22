@@ -143,20 +143,27 @@ def move_to_device(block_chunk, device):
 class Transformer:
     def __init__(self, model_dir, config, device="cpu"):
         model_dir = model_dir
-        self.device=device
-        if config["model_type"] == "llama":
-            self.freqs_rope = LLAMA3_PositionalEmbeddings.precompute_rope_constants(
-                config["hidden_size"] // config["num_attention_heads"],
-                config["max_position_embeddings"] * 2,
-                config["rope_theta"],
-            ).to(self.device)
-        elif config["model_type"] == "phi3":
-            self.freqs_rope = None
-
         self.config = config
-        self.max_seq_len = config["max_position_embeddings"]
-        self.num_layers = config["num_hidden_layers"]
-        self.caches_memory = build_kv_caches(config, device=self.device)
+        self.device=device
+        if self.config["model_type"] == "llama":
+            self.freqs_rope = LLAMA3_PositionalEmbeddings.precompute_rope_constants(
+                self.config["hidden_size"] // self.config["num_attention_heads"],
+                self.config["max_position_embeddings"]* 2,
+                self.config["rope_theta"],
+            ).to(self.device)
+        elif self.config["model_type"] == "phi3":
+            position_ids = torch.arange(
+                0, self.config["max_position_embeddings"], dtype=torch.long
+            )
+            position_ids = position_ids.unsqueeze(0).view(-1, self.config["max_position_embeddings"])
+            self.freqs_rope = Phi3_PositionalEmbeddings.precompute_rope_constants(
+                position_ids=position_ids,
+                dim=self.config["hidden_size"] // self.config["num_attention_heads"],
+                base=self.config["rope_theta"],
+            ).to(self.device, dtype=torch.bfloat16) # TODO: unhardcode this precision
+        self.max_seq_len = self.config["max_position_embeddings"]
+        self.num_layers = self.config["num_hidden_layers"]
+        self.caches_memory = build_kv_caches(self.config, device=self.device)
 
         # TODO: to support original precision models, for each weight add a dummy entry for "*_scales" and "orig_shapes" keys, and None value.
         self.chunk_weights = load_block_chunk(model_dir, 0) # assume all weights are in single chunk
@@ -190,16 +197,7 @@ class Transformer:
         seq_len = tokens.shape[-1]
         seq_embeddings = embedding_quantized(tokens, self.embedding_weights, self.embedding_weights_scales)
         if self.config["model_type"] == "phi3":
-            position_ids = torch.arange(
-                start_pos, seq_len + start_pos, dtype=torch.long, device=self.device
-            )
-            position_ids = position_ids.unsqueeze(0).view(-1, seq_len)
-            freqs_rope = Phi3_PositionalEmbeddings.precompute_rope_constants(
-                seq_embeddings,
-                position_ids=position_ids,
-                dim=self.config["hidden_size"] // self.config["num_attention_heads"],
-                base=self.config["rope_theta"],
-            )#.to(self.device) # internally it'll automatically transfer to the device TODO: make phi3 embs return a tensor, not a tuple
+            freqs_rope = self.freqs_rope[:, start_pos : start_pos + seq_len]
         else:
             freqs_rope = self.freqs_rope[start_pos : start_pos + seq_len]
         mask = build_attention_mask(seq_len, start_pos, device=tokens.device, dtype=seq_embeddings.dtype)
