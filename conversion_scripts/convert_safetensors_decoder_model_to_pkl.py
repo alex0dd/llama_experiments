@@ -13,7 +13,9 @@ from ops.utils import load_multiple_transformer_block_weights_and_remap
 from quantization.utils_int4 import quantize_fp32_linear_to_int4, quantize_pack_embedding_table_v2
 from quantization.utils_int8 import quantize_fp32_linear_to_int8
 
-from utils.utils import get_all_safetensors_model_files, load_json
+from utils.utils import get_all_keyword_files, load_json
+
+import shutil
 
 def is_linear_weight(layer_name):
     return "mlp." in layer_name and ".weight" in layer_name
@@ -24,33 +26,72 @@ def is_attention_linear(layer_name):
 def is_bias(param_name):
     return param_name.endswith(".bias")
 
+def split_qkv(qkv_tensor, layer_name, quant_type):
+    out_dict = {}
+    # We need to split into q, k, v
+    # Support only int8 for now
+    # The layer will be named: self_attn.qkv_proj.weight
+    qkv_tensor = torch.split(
+        qkv_tensor,
+        qkv_tensor.shape[0]//3
+    )
+    q_tensor = qkv_tensor[0]
+    k_tensor = qkv_tensor[1]
+    v_tensor = qkv_tensor[2]
+
+    if quant_type == "int8":
+        q_quantized, q_scale = quantize_fp32_linear_to_int8(q_tensor)
+        k_quantized, k_scale = quantize_fp32_linear_to_int8(k_tensor)
+        v_quantized, v_scale = quantize_fp32_linear_to_int8(v_tensor)
+
+    # For later code compatibility
+    q_orig_shapes = q_tensor.shape
+    k_orig_shapes = k_tensor.shape
+    v_orig_shapes = v_tensor.shape
+
+    q_layer_name = layer_name.replace("qkv", "q")
+    k_layer_name = layer_name.replace("qkv", "k")
+    v_layer_name = layer_name.replace("qkv", "v")
+
+    out_dict[q_layer_name] = q_quantized
+    out_dict[q_layer_name+"_scales"] = q_scale
+    out_dict[q_layer_name+"_orig_shape"] = q_orig_shapes
+
+    out_dict[k_layer_name] = k_quantized
+    out_dict[k_layer_name+"_scales"] = k_scale
+    out_dict[k_layer_name+"_orig_shape"] = k_orig_shapes
+
+    out_dict[v_layer_name] = v_quantized
+    out_dict[v_layer_name+"_scales"] = v_scale
+    out_dict[v_layer_name+"_orig_shape"] = v_orig_shapes
+
+    return out_dict
+
 def quantize_all_mlps(blocks_chunk, quant_type="int8", device="cpu"):
     for layer_idx in blocks_chunk.keys():
         blocks_update_dict = {}
+        remove_layers = []
         for layer_name in blocks_chunk[layer_idx].keys():
             is_layer_bias = is_bias(layer_name)
             param_instance = blocks_chunk[layer_idx][layer_name]
-            #if is_linear_weight(layer_name) or is_attention_linear(layer_name) or is_layer_bias:
             if is_linear_weight(layer_name) or is_attention_linear(layer_name):
-                #if is_layer_bias and quant_type:
-                #    # pad from [bias_dim] to [1, bias_dim]
-                #    param_instance = param_instance.unsqueeze(0)
-
-                if quant_type == "int8":
-                    block_quantized, block_scale = quantize_fp32_linear_to_int8(param_instance)
-                elif quant_type == "int4":
-                    block_quantized, block_scale = quantize_fp32_linear_to_int4(param_instance, layer_name, device=device)
-                
-                #if is_layer_bias and quant_type:
-                #    # unpad from [1, bias_dim] to [bias_dim]
-                #    param_instance = param_instance.squeeze(0)
-
-                # We'll always store original shapes for later code compatibility
-                orig_shapes = param_instance.shape
-                
-                blocks_chunk[layer_idx][layer_name] = block_quantized
-                blocks_update_dict[layer_name+"_scales"] = block_scale
-                blocks_update_dict[layer_name+"_orig_shape"] = orig_shapes
+                if "qkv_proj" in layer_name:
+                    qkv_update_dict = split_qkv(blocks_chunk[layer_idx][layer_name], layer_name, quant_type)
+                    blocks_update_dict.update(qkv_update_dict)
+                    remove_layers.append(layer_name)
+                else:
+                    if quant_type == "int8":
+                        block_quantized, block_scale = quantize_fp32_linear_to_int8(param_instance)
+                    elif quant_type == "int4":
+                        block_quantized, block_scale = quantize_fp32_linear_to_int4(param_instance, layer_name, device=device)
+                    # We'll always store original shapes for later code compatibility
+                    orig_shapes = param_instance.shape
+                    blocks_chunk[layer_idx][layer_name] = block_quantized
+                    blocks_update_dict[layer_name+"_scales"] = block_scale
+                    blocks_update_dict[layer_name+"_orig_shape"] = orig_shapes
+        # Potentially remove keys that need to be removed (e.g., qkv if it was split into q/k/v)
+        for k in remove_layers:
+            blocks_update_dict.pop(k, None)
         blocks_chunk[layer_idx].update(blocks_update_dict)
 
 def parse_all_args():
@@ -116,16 +157,17 @@ disable_llama_qk_remap = args.disable_llama_qk_remap
 base_model_dir = args.base_model_dir
 output_model_dir = args.output_model_dir
 
-model_files = get_all_safetensors_model_files(base_model_dir)
+config_file_path = f"./{base_model_dir}/config.json"
+model_files = get_all_keyword_files(base_model_dir, "safetensors", mode="endswith")
 model_parser = ModelParser(model_files)
-config = load_json(f"./{base_model_dir}/config.json")
+config = load_json(config_file_path)
 config["max_position_embeddings"] = 2048
 tie_word_embeddings = config["tie_word_embeddings"]
 
-converted_model_path = output_model_dir+("" if not quantization_type else f"-{quantization_type}")
+output_model_dir = output_model_dir+("" if not quantization_type else f"-{quantization_type}")
 
-if not os.path.exists(converted_model_path):
-    os.makedirs(converted_model_path)
+if not os.path.exists(output_model_dir):
+    os.makedirs(output_model_dir)
 
 num_layers = int(config["num_hidden_layers"])
 preload_n_transformer_blocks = num_layers # preload all (since we're dealing with not so big models)
@@ -146,7 +188,7 @@ for layer_idx in range(num_layers):
             quantize_all_mlps(current_transformer_blocks_loaded, quant_type=quantization_type, device=device)
         delta_t = time.time() - start_t
         print(f"Finished to load layers: {layer_idxs_to_load} in {delta_t} seconds.")
-        with open(os.path.join(converted_model_path, f"blocks_chunk_{current_chunk}.pkl"), "wb") as f:
+        with open(os.path.join(output_model_dir, f"blocks_chunk_{current_chunk}.pkl"), "wb") as f:
             pickle.dump(current_transformer_blocks_loaded, f)
     layer_idxs_to_load.pop(0) # remove index as "consumed"
 
@@ -182,5 +224,12 @@ if not tie_word_embeddings:
     else:
         general_chunk_dict['lm_head.weight'] = output_embedding_weights.to(device)
 
-with open(os.path.join(converted_model_path, f"general_chunk.pkl"), "wb") as f:
+with open(os.path.join(output_model_dir, f"general_chunk.pkl"), "wb") as f:
     pickle.dump(general_chunk_dict, f)
+
+# Copy config file
+shutil.copy2(config_file_path, output_model_dir)
+# Copy all tokenizer files
+tokenizer_files = get_all_keyword_files(base_model_dir, "token", mode="contains")
+for f in tokenizer_files:
+    shutil.copy2(f, output_model_dir)

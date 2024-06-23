@@ -3,3 +3,5 @@ numpy
 torch
 jupyterlab
 transformers
+sentencepiece
+mistral-common

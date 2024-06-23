@@ -80,3 +80,13 @@ def get_all_safetensors_model_files(model_dir):
         if file.endswith(".safetensors"):
             all_safetensors.append(os.path.join(model_dir, file))
     return all_safetensors
+
+def get_all_keyword_files(model_dir, keyword, mode="contains"):
+    assert mode in ["contains", "endswith"]
+    all_files = []
+    files_in_dir = os.listdir(model_dir)
+    for file in files_in_dir:
+        pred = keyword in file if mode == "contains" else file.endswith(keyword)
+        if pred:
+            all_files.append(os.path.join(model_dir, file))
+    return all_files

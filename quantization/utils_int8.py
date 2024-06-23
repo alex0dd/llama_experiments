@@ -16,5 +16,5 @@ def linear_int8(inputs, weight, scales, bias=None, original_shape=None):
 def embedding_int8(inputs, weights, scales=None, original_shape=None):
     embs = torch.nn.functional.embedding(inputs, weights)
     if scales is not None:
-        embs*= scales
+        embs = embs.to(scales.dtype) * scales
     return embs

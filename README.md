@@ -13,12 +13,15 @@ python -m cProfile -s time run_model.py > profile.text 2>&1
 ```
 
 ```
-python -m conversion_scripts.convert_safetensors_llama3_model_to_pkl --quantization_type int8
-python -m conversion_scripts.convert_safetensors_phi3_model_to_pkl --quantization_type int8
-python -m conversion_scripts.convert_safetensors_llama3_model_to_pkl --quantization_type int8 --base_model_dir Mistral-7B-Instruct-v0.3 --output_model_dir MISTRAL-7B-PKL
-python -m conversion_scripts.convert_safetensors_llama3_model_to_pkl --quantization_type int8 --base_model_dir granite-3b-code-base --output_model_dir GRANITE-3B-CODE-BASE-PKL --no-quantize_embeddings --disable-llama-qk-remap
-python -m conversion_scripts.convert_safetensors_llama3_model_to_pkl --base_model_dir granite-3b-code-instruct --output_model_dir GRANITE-3B-CODE-INSTRUCT-PKL --no-quantize_embeddings --disable-llama-qk-remap
-python -m conversion_scripts.convert_safetensors_llama3_model_to_pkl --base_model_dir granite-3b-code-instruct --output_model_dir GRANITE-3B-CODE-INSTRUCT-PKL --quantization_type int8 --no-quantize_embeddings --disable-llama-qk-remap
+python -m conversion_scripts.convert_safetensors_decoder_model_to_pkl --quantization_type int8 --base_model_dir original_models/Meta-Llama-3-8B --output_model_dir converted_models/LLAMA-3-8B-PKL
+
+python -m conversion_scripts.convert_safetensors_decoder_model_to_pkl --quantization_type int8 --base_model_dir original_models/Phi-3-mini-4k-instruct --output_model_dir converted_models/PHI3-MINI-4K-PKL
+
+python -m conversion_scripts.convert_safetensors_decoder_model_to_pkl --quantization_type int8 --base_model_dir original_models/Mistral-7B-Instruct-v0.3 --output_model_dir converted_models/MISTRAL-7B-PKL
+
+python -m conversion_scripts.convert_safetensors_decoder_model_to_pkl --base_model_dir original_models/granite-3b-code-instruct --output_model_dir converted_models/GRANITE-3B-CODE-INSTRUCT-PKL --disable-llama-qk-remap
+
+python -m conversion_scripts.convert_safetensors_decoder_model_to_pkl --base_model_dir original_models/granite-3b-code-instruct --output_model_dir converted_models/GRANITE-3B-CODE-INSTRUCT-PKL --quantization_type int8 --no-quantize_embeddings --disable-llama-qk-remap
 ```
 
 Unquantized versions will run faster, as they won't have the rescaling and casting overheads.

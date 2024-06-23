@@ -19,9 +19,9 @@ def linear_default(inputs, weight, scales=None, bias=None, original_shape=None):
     return out
 
 linears = {
+    "default": linear_default,
     "int4": linear_int4,
-    "int8": linear_int8,
-    "default": linear_default
+    "int8": linear_int8
 }
 embeddings = {
     "default": embedding_matrix,
@@ -58,10 +58,18 @@ def functional_ffn_quantized(x: torch.Tensor, weights: Dict[str, torch.Tensor]):
 @torch.inference_mode()
 def functional_ffn_phi3_quantized(x: torch.Tensor, weights: Dict[str, torch.Tensor]):
     # TODO: refactor this with weights.get
-    up_states = linear_quantized(x, weights["mlp.gate_up_proj.weight"], weights["mlp.gate_up_proj.weight_scales"], weights["mlp.gate_up_proj.weight_orig_shape"])
+    up_states = linear_quantized(
+        x, weights["mlp.gate_up_proj.weight"], 
+        weights.get("mlp.gate_up_proj.weight_scales"), 
+        original_shape=weights.get("mlp.gate_up_proj.weight_orig_shape")
+    )
     gate, up_states = up_states.chunk(2, dim=-1)
     up_states = torch.nn.functional.silu(gate) * up_states
-    output = linear_quantized(up_states, weights["mlp.down_proj.weight"], weights["mlp.down_proj.weight_scales"], weights["mlp.down_proj.weight_orig_shape"])
+    output = linear_quantized(
+        up_states, weights["mlp.down_proj.weight"],
+        weights.get("mlp.down_proj.weight_scales"), 
+        original_shape=weights.get("mlp.down_proj.weight_orig_shape")
+    )
     return output
 
 def _normalization(inputs: torch.Tensor, eps:float = 1e-5) -> torch.Tensor:
@@ -193,6 +201,7 @@ def functional_transformer_block(x: torch.Tensor, weights, cache_k, cache_v, sta
         output = hidden + functional_ffn_quantized(attended_hidden, weights)
     return output
 
+# TODO: merge the two move functions into one that recursively will do the moves
 def move_to_device(block_chunk, device):
     for layer_idx in block_chunk.keys():
         for layer_name in block_chunk[layer_idx].keys():
@@ -229,37 +238,10 @@ class Transformer:
         self.num_layers = self.config["num_hidden_layers"]
         self.caches_memory = build_kv_caches(self.config, device=self.device)
 
-        # TODO: to support original precision models, for each weight add a dummy entry for "*_scales" and "orig_shapes" keys, and None value.
         self.chunk_weights = load_block_chunk(model_dir, 0) # assume all weights are in single chunk
         move_to_device(self.chunk_weights, self.device)
         self.general_chunk_weights = load_general_chunk(model_dir)
         move_to_device_general(self.general_chunk_weights, self.device)
-        
-        # TODO: simplify this behavior (tie embeddings + scales/shapes assigning)
-        # TODO: create a dict with general weights to pass around
-        """
-        self.embedding_weights = self.general_chunk_weights['model.embed_tokens.weight'].to(self.device)
-        if 'model.embed_tokens.weight_scales' in self.general_chunk_weights:
-            self.embedding_weights_scales = self.general_chunk_weights['model.embed_tokens.weight_scales'].to(self.device)
-        else:
-            self.embedding_weights_scales = None
-        
-        if config["tie_word_embeddings"]:
-            self.output_embedding_weights = self.embedding_weights.T
-            self.output_embedding_scales = self.embedding_weights_scales
-            self.output_embedding_orig_shape = None
-        else:
-            self.output_embedding_weights = self.general_chunk_weights['lm_head.weight'].to(self.device)
-            if 'lm_head.weight_scales' in self.general_chunk_weights:
-                self.output_embedding_scales = self.general_chunk_weights['lm_head.weight_scales'].to(self.device)
-            else:
-                self.output_embedding_scales = None
-            if 'lm_head.weight_orig_shape' in self.general_chunk_weights:
-                self.output_embedding_orig_shape = self.general_chunk_weights['lm_head.weight_orig_shape']
-            else:
-                self.output_embedding_orig_shape = None
-        self.output_norm_weights = self.general_chunk_weights['model.norm.weight'].to(self.device)
-        """
         if config["tie_word_embeddings"]:
             self.general_chunk_weights['lm_head.weight'] = self.general_chunk_weights['model.embed_tokens.weight']
 
