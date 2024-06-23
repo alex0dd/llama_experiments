@@ -13,7 +13,7 @@ from ops.utils import load_multiple_transformer_block_weights_and_remap
 from quantization.utils_int4 import quantize_fp32_linear_to_int4, quantize_pack_embedding_table_v2
 from quantization.utils_int8 import quantize_fp32_linear_to_int8
 
-from utils.utils import load_json
+from utils.utils import get_all_safetensors_model_files, load_json
 
 def is_linear_weight(layer_name):
     return "mlp." in layer_name and ".weight" in layer_name
@@ -56,6 +56,18 @@ def parse_all_args():
         default="cpu",
         help="Specify the device: cpu or cuda. Defaults to 'cpu' if not specified."
     )
+    arg_parser.add_argument(
+        "--base_model_dir",
+        type=str,
+        default="Meta-Llama-3-8B",
+        help="Specify the path of base model directory containing LLAMA3. Defaults to 'Meta-Llama-3-8B' if not specified."
+    )
+    arg_parser.add_argument(
+        "--output_model_dir",
+        type=str,
+        default="LLAMA3-8B-PKL",
+        help="Specify the path of the output model directory that will contain the converted checkpoint. Defaults to 'LLAMA3-8B-PKL'+quantization_type if not specified."
+    )
     
     # Parse the arguments
     args = arg_parser.parse_args()
@@ -67,24 +79,21 @@ print(args)
 quantization_type = args.quantization_type
 device = args.device
 
-base_model_dir = "Meta-Llama-3-8B"
+base_model_dir = args.base_model_dir
+output_model_dir = args.output_model_dir
 
-model_parser = ModelParser([
-    f"./{base_model_dir}/model-00001-of-00004.safetensors",
-    f"./{base_model_dir}/model-00002-of-00004.safetensors",
-    f"./{base_model_dir}/model-00003-of-00004.safetensors",
-    f"./{base_model_dir}/model-00004-of-00004.safetensors",
-])
+model_files = get_all_safetensors_model_files(base_model_dir)
+model_parser = ModelParser(model_files)
 config = load_json(f"./{base_model_dir}/config.json")
 config["max_position_embeddings"] = 2048
 
-converted_model_path = "LLAMA3-8B-PKL"+("" if not quantization_type else f"-{quantization_type}")
+converted_model_path = output_model_dir+("" if not quantization_type else f"-{quantization_type}")
 
 if not os.path.exists(converted_model_path):
     os.makedirs(converted_model_path)
 
-num_layers = config["num_hidden_layers"]
-preload_n_transformer_blocks = 32
+num_layers = int(config["num_hidden_layers"])
+preload_n_transformer_blocks = num_layers # preload all (since we're dealing with not so big models)
 
 current_transformer_blocks_loaded = None
 layer_idxs_to_load = []
