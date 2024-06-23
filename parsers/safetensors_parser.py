@@ -1,25 +1,30 @@
 import json
-
-from utils import bytes_to_uint, load_tensor_from_memory, MultiFileHandler
-from utils import parse_bf16_tensor_v3 as parse_bf16_tensor
-
-import torch
 from typing import Dict, List
 
-class SafeTensorsParser:
+import torch
 
+from utils import MultiFileHandler, bytes_to_uint
+from utils import parse_bf16_tensor_v3 as parse_bf16_tensor
+
+
+class SafeTensorsParser:
     def __init__(self, file_path):
         self._file_path = file_path
-        self._tensor_metadata, self._metadata, self._data_base_offset = self._parse_structure(self._file_path)
+        self._tensor_metadata, self._metadata, self._data_base_offset = (
+            self._parse_structure(self._file_path)
+        )
 
     @property
     def tensor_names(self):
         return list(self._tensor_metadata.keys())
-    
+
     @property
     def tensor_shapes(self):
-        return [(name, self._tensor_metadata[name]["shape"]) for name in self._tensor_metadata.keys()]
-    
+        return [
+            (name, self._tensor_metadata[name]["shape"])
+            for name in self._tensor_metadata.keys()
+        ]
+
     def shape(self, name):
         return self._tensor_metadata[name]["shape"]
 
@@ -27,7 +32,7 @@ class SafeTensorsParser:
         """
         Inputs:
             - file_path: path of safetensors file
-        
+
         File structure
         8 bytes: N=u64 int containing header size
         N bytes: JSON utf-8 string representing header
@@ -35,10 +40,10 @@ class SafeTensorsParser:
         """
         with open(file_path, "rb") as file:
             header_size_field_length = 8
-            header_size = file.read(header_size_field_length) # header size
-            header_size = bytes_to_uint(header_size) # 0-7
+            header_size = file.read(header_size_field_length)  # header size
+            header_size = bytes_to_uint(header_size)  # 0-7
             data_base_offset = header_size_field_length + header_size
-            header = file.read(header_size) # 8 - 8 + N (read header_size bytes)
+            header = file.read(header_size)  # 8 - 8 + N (read header_size bytes)
             header = json.loads(header)
             tensor_metadata, metadata = self._parse_header(header)
 
@@ -51,7 +56,9 @@ class SafeTensorsParser:
         tensor_metadata = {}
         metadata = None
         for key, value in header.items():
-            if key == "__metadata__": metadata = value; continue
+            if key == "__metadata__":
+                metadata = value
+                continue
             tensor_metadata[key] = value
         return tensor_metadata, metadata
 
@@ -70,9 +77,11 @@ class SafeTensorsParser:
         with MultiFileHandler(self._file_path) as file_handler:
             data_raw = self._get_tensor_data_raw_mfh(name, file_handler)
         return data_raw
-    
+
     def get_tensor(self, name, file_handler=None):
-        assert name in self.tensor_names, f"Tensor {name} is not in list of tensor names loaded from {self._file_path}"
+        assert (
+            name in self.tensor_names
+        ), f"Tensor {name} is not in list of tensor names loaded from {self._file_path}"
         shape = self._tensor_metadata[name]["shape"]
         if file_handler is None:
             current_tensor_raw = self._get_tensor_data_raw(name)
@@ -82,12 +91,16 @@ class SafeTensorsParser:
         # TODO: add parsing cache, so that if a tensor was parsed, it can be offloaded to HDD or in RAM
         return current_tensor
 
-    def get_tensors_without_closing_file(self, names: List[str]) -> Dict[str, torch.Tensor]:
-        for name in names: assert name in self.tensor_names, f"Tensor {name} is not in list of tensor names loaded from {self._file_path}"
+    def get_tensors_without_closing_file(
+        self, names: List[str]
+    ) -> Dict[str, torch.Tensor]:
+        for name in names:
+            assert (
+                name in self.tensor_names
+            ), f"Tensor {name} is not in list of tensor names loaded from {self._file_path}"
         outputs = {}
         # Using a single file read, read all the required tensors from it at once.
         with MultiFileHandler(self._file_path) as file_handler:
             for name in names:
                 outputs[name] = self.get_tensor(name, file_handler=file_handler)
         return outputs
-                

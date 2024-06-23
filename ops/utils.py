@@ -1,25 +1,35 @@
+import pickle
+from collections import defaultdict
+from typing import Dict
+
 import torch
 
-from collections import defaultdict
-
-from typing import Dict, List
-
-import pickle
 
 def load_block_chunk(model_dir, block_chunk_idx):
-    with open(f'{model_dir}/blocks_chunk_{block_chunk_idx}.pkl', 'rb') as handle:
+    with open(f"{model_dir}/blocks_chunk_{block_chunk_idx}.pkl", "rb") as handle:
         b = pickle.load(handle)
     return b
+
 
 def load_general_chunk(model_dir):
-    with open(f'{model_dir}/general_chunk.pkl', 'rb') as handle:
+    with open(f"{model_dir}/general_chunk.pkl", "rb") as handle:
         b = pickle.load(handle)
     return b
 
-def hf_undo_permute(w: torch.Tensor, n_heads: int, dim1: int, dim2: int) -> torch.Tensor:
-    return w.view(n_heads, 2, dim1 // n_heads // 2, dim2).transpose(1, 2).reshape(dim1, dim2)
 
-def remap_weights_if_needed(weights: torch.Tensor, param_name: str, config) -> torch.Tensor:
+def hf_undo_permute(
+    w: torch.Tensor, n_heads: int, dim1: int, dim2: int
+) -> torch.Tensor:
+    return (
+        w.view(n_heads, 2, dim1 // n_heads // 2, dim2)
+        .transpose(1, 2)
+        .reshape(dim1, dim2)
+    )
+
+
+def remap_weights_if_needed(
+    weights: torch.Tensor, param_name: str, config
+) -> torch.Tensor:
     """
     Important: HF checkpoint permutes the original weights for Q, K weight tensors
     https://github.com/huggingface/transformers/blob/25245ec26dc29bcf6102e1b4ddd0dfd02e720cf5/src/transformers/models/llama/convert_llama_weights_to_hf.py#L174-L182
@@ -39,7 +49,7 @@ def remap_weights_if_needed(weights: torch.Tensor, param_name: str, config) -> t
         n_heads = config["num_attention_heads"]
         n_heads_per_shard = n_heads // num_shards
         num_local_key_value_heads = n_heads_per_shard // num_key_value_heads
-        
+
         weights = hf_undo_permute(
             weights,
             n_heads=config["num_key_value_heads"],
@@ -48,6 +58,7 @@ def remap_weights_if_needed(weights: torch.Tensor, param_name: str, config) -> t
         )
     return weights
 
+
 def get_all_layer_names_in_block(layer_idx: int, config) -> Dict[str, str]:
     """
     Returns a dictionary with keys being layer names for a given transformer block
@@ -55,25 +66,32 @@ def get_all_layer_names_in_block(layer_idx: int, config) -> Dict[str, str]:
     """
     weight_remap = {}
     if config["model_type"] == "phi3":
-        attn_letters = ['o', 'qkv']
-        mlp_names = ['down_proj', 'gate_up_proj']
+        attn_letters = ["o", "qkv"]
+        mlp_names = ["down_proj", "gate_up_proj"]
     else:
-        attn_letters = ['q', 'k', 'v', 'o']
-        mlp_names = ['down_proj', 'gate_proj', 'up_proj']
-    norm_names = ['input_layernorm', 'post_attention_layernorm']
+        attn_letters = ["q", "k", "v", "o"]
+        mlp_names = ["down_proj", "gate_proj", "up_proj"]
+    norm_names = ["input_layernorm", "post_attention_layernorm"]
     for letter in attn_letters:
-        weight_remap[f'model.layers.{layer_idx}.self_attn.{letter}_proj.weight'] = f'self_attn.{letter}_proj.weight'
+        weight_remap[f"model.layers.{layer_idx}.self_attn.{letter}_proj.weight"] = (
+            f"self_attn.{letter}_proj.weight"
+        )
         if "attention_bias" in config and config["attention_bias"]:
-            weight_remap[f'model.layers.{layer_idx}.self_attn.{letter}_proj.bias'] = f'self_attn.{letter}_proj.bias'
+            weight_remap[f"model.layers.{layer_idx}.self_attn.{letter}_proj.bias"] = (
+                f"self_attn.{letter}_proj.bias"
+            )
     for mlp in mlp_names:
-        weight_remap[f'model.layers.{layer_idx}.mlp.{mlp}.weight'] = f'mlp.{mlp}.weight'
+        weight_remap[f"model.layers.{layer_idx}.mlp.{mlp}.weight"] = f"mlp.{mlp}.weight"
         if "mlp_bias" in config and config["mlp_bias"]:
-            weight_remap[f'model.layers.{layer_idx}.mlp.{mlp}.bias'] = f'mlp.{mlp}.bias'
+            weight_remap[f"model.layers.{layer_idx}.mlp.{mlp}.bias"] = f"mlp.{mlp}.bias"
     for norm in norm_names:
-        weight_remap[f'model.layers.{layer_idx}.{norm}.weight'] = f'{norm}.weight'
+        weight_remap[f"model.layers.{layer_idx}.{norm}.weight"] = f"{norm}.weight"
     return weight_remap
 
-def load_multiple_transformer_block_weights_and_remap(parser, config, layer_idxs, device, disable_llama_qk_remap=False):
+
+def load_multiple_transformer_block_weights_and_remap(
+    parser, config, layer_idxs, device, disable_llama_qk_remap=False
+):
     """
     Helper function that loads all the weights for given transformer block indices minimizing
     the number of file reads, and transfers them to the given decide.
@@ -94,11 +112,25 @@ def load_multiple_transformer_block_weights_and_remap(parser, config, layer_idxs
         remapped_weight_name = all_weights_remap[weight_name]
         # Move the original loaded weight with original weight name, into the loaded_weights dict (and repermute it if needed, e.g. in attn q, k cases)
         if not disable_llama_qk_remap:
-            final_weights = remap_weights_if_needed(all_loaded_weights[weight_name], weight_name, config)
+            final_weights = remap_weights_if_needed(
+                all_loaded_weights[weight_name], weight_name, config
+            )
         else:
             final_weights = all_loaded_weights[weight_name]
-        loaded_weights[layer_idx][remapped_weight_name] = final_weights.to(device)         
+
+        if config["model_type"] in ["phi3"] and "qkv_proj" in remapped_weight_name:
+            # Split qkv into 3 separate tensors
+            qkv_tensor = torch.split(final_weights, final_weights.shape[0] // 3)
+            q_tensor = qkv_tensor[0]
+            k_tensor = qkv_tensor[1]
+            v_tensor = qkv_tensor[2]
+            loaded_weights[layer_idx]["self_attn.q_proj.weight"] = q_tensor.to(device)
+            loaded_weights[layer_idx]["self_attn.k_proj.weight"] = k_tensor.to(device)
+            loaded_weights[layer_idx]["self_attn.v_proj.weight"] = v_tensor.to(device)
+        else:
+            loaded_weights[layer_idx][remapped_weight_name] = final_weights.to(device)
     return loaded_weights
+
 
 def build_kv_caches(config, device, max_seq_len=2048, max_bs=4):
     """
@@ -115,10 +147,12 @@ def build_kv_caches(config, device, max_seq_len=2048, max_bs=4):
     Bytes per layer = 4194304 * 4 (assuming float) = 16777216 bytes (16MB per layer)
     Bytes per model = 16777216 * NUM_LAYERS = 16777216 * 32 = 536870912 (512MB per model)
     """
-    if "torch." not in config["torch_dtype"]: torch_dtype = "torch."+config["torch_dtype"]
-    else: torch_dtype = config["torch_dtype"]
+    if "torch." not in config["torch_dtype"]:
+        torch_dtype = "torch." + config["torch_dtype"]
+    else:
+        torch_dtype = config["torch_dtype"]
     # We need this, as pytorch can't build a type instance from string
-    dtype_map ={
+    dtype_map = {
         "torch.bfloat16": torch.bfloat16,
         "torch.int8": torch.int8,
         "torch.uint8": torch.uint8,
@@ -133,9 +167,18 @@ def build_kv_caches(config, device, max_seq_len=2048, max_bs=4):
     head_dim = config["hidden_size"] // config["num_attention_heads"]
     for layer_idx in range(config["num_hidden_layers"]):
         caches_memory[layer_idx] = {}
-        caches_memory[layer_idx]["k"] = torch.zeros((max_bs, max_seq_len, n_kv_heads, head_dim), dtype=dtype_map[torch_dtype], device=device)
-        caches_memory[layer_idx]["v"] = torch.zeros((max_bs, max_seq_len, n_kv_heads, head_dim), dtype=dtype_map[torch_dtype], device=device)
+        caches_memory[layer_idx]["k"] = torch.zeros(
+            (max_bs, max_seq_len, n_kv_heads, head_dim),
+            dtype=dtype_map[torch_dtype],
+            device=device,
+        )
+        caches_memory[layer_idx]["v"] = torch.zeros(
+            (max_bs, max_seq_len, n_kv_heads, head_dim),
+            dtype=dtype_map[torch_dtype],
+            device=device,
+        )
     return caches_memory
+
 
 @torch.inference_mode()
 def build_attention_mask(seq_len, start_pos, device, dtype):
@@ -157,6 +200,7 @@ def build_attention_mask(seq_len, start_pos, device, dtype):
             [torch.zeros((seq_len, start_pos), device=device), mask]
         ).to(dtype)
     return mask
+
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """

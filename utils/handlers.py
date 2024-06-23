@@ -1,11 +1,13 @@
 from typing import List
 
+
 class MultiFileHandler:
     """
     Context manager for reading from multiple files at once, without closing them
     """
+
     def __init__(self, file_paths: List[str]):
-        if not type(file_paths) is list:
+        if not isinstance(file_paths, list):
             file_paths = [file_paths]
         self.file_paths = file_paths
         self.files = {}

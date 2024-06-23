@@ -1,13 +1,15 @@
-import math
-import struct
 import json
+import math
 import os
+import struct
 
 import numpy as np
+
 try:
     import torch
-except:
+except ImportError:
     print("PyTorch is not available")
+
 
 def bf16_to_fp32(bf16_val):
     # https://docs.python.org/3/library/struct.html#format-characters
@@ -16,44 +18,51 @@ def bf16_to_fp32(bf16_val):
     bytes_conc = b"".join(bytes_list)
     return struct.unpack("<f", bytes_conc)[0]
 
+
 def parse_bf16_tensor(tensor, shape):
     parsed_vals = []
     # bf16 takes 2 bytes in memory
     for i in range(0, len(tensor), 2):
-        current_entry = tensor[i:i+2]
+        current_entry = tensor[i : i + 2]
         current_entry = bf16_to_fp32(current_entry)
         parsed_vals.append(current_entry)
     parsed_vals = np.array(parsed_vals).reshape(shape)
     return parsed_vals
 
+
 def parse_bf16_tensor_v2(tensor, shape):
     parsed_vals = np.zeros(shape=shape, dtype=np.float32)
     # bf16 takes 2 bytes in memory
     for i in range(0, len(tensor), 2):
-        current_entry = tensor[i:i+2]
+        current_entry = tensor[i : i + 2]
         current_entry = bf16_to_fp32(current_entry)
         col, row = math.floor((i // 2) / shape[0]), (i // 2) % shape[0]
         try:
             parsed_vals[row - 1, col] = current_entry
         except:
-            print(i, i//2, row, col)
+            print(i, i // 2, row, col)
             raise
     return parsed_vals
+
 
 def parse_bf16_tensor_v3(tensor, shape):
     tensor = bytearray(tensor)
     parsed_vals = torch.frombuffer(tensor, dtype=torch.bfloat16).reshape(shape)
     return parsed_vals
 
+
 def bytes_to_uint(b):
-    return int.from_bytes(b, byteorder='little', signed=False)
+    return int.from_bytes(b, byteorder="little", signed=False)
+
 
 def build_offsetted_getter(data, base_offset):
     def get_tensor(tensor_metadata_entry):
         begin_offset = tensor_metadata_entry["data_offsets"][0] + base_offset
         end_offset = tensor_metadata_entry["data_offsets"][1] + base_offset
-        return data[begin_offset: end_offset]
+        return data[begin_offset:end_offset]
+
     return get_tensor
+
 
 def load_tensor_from_memory(file_name, begin_pos, n_of_bytes):
     """
@@ -65,13 +74,16 @@ def load_tensor_from_memory(file_name, begin_pos, n_of_bytes):
         raw_data = file.read(n_of_bytes)
     return raw_data
 
+
 def deallocate_tensor(tensor):
     del tensor
 
+
 def load_json(file_path):
-    with open(file_path, 'r') as file:
+    with open(file_path, "r") as file:
         config = json.load(file)
     return config
+
 
 def get_all_safetensors_model_files(model_dir):
     all_safetensors = []
@@ -80,6 +92,7 @@ def get_all_safetensors_model_files(model_dir):
         if file.endswith(".safetensors"):
             all_safetensors.append(os.path.join(model_dir, file))
     return all_safetensors
+
 
 def get_all_keyword_files(model_dir, keyword, mode="contains"):
     assert mode in ["contains", "endswith"]

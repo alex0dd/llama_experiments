@@ -5,3 +5,4 @@ jupyterlab
 transformers
 sentencepiece
 mistral-common
+ruff

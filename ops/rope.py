@@ -1,19 +1,20 @@
+from typing import Tuple
+
 import torch
 
-from typing import Tuple
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     """
     This function is taken and adapted from https://github.com/meta-llama/llama3/blob/main/llama/model.py
-    """ 
+    """
     ndim = x.ndim
     assert 0 <= 1 < ndim
     assert freqs_cis.shape == (x.shape[1], x.shape[-1])
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(*shape)
 
-class Phi3_PositionalEmbeddings:
 
+class Phi3_PositionalEmbeddings:
     @staticmethod
     # Copied from transformers.models.llama.modeling_llama.rotate_half
     def rotate_half(x):
@@ -21,22 +22,28 @@ class Phi3_PositionalEmbeddings:
         x1 = x[..., : x.shape[-1] // 2]
         x2 = x[..., x.shape[-1] // 2 :]
         return torch.cat((-x2, x1), dim=-1)
-    
+
     @torch.no_grad()
     def precompute_rope_constants(position_ids, base, dim):
         # x: [bs, num_attention_heads, seq_len, head_size]
         inv_freq = 1.0 / (
             base ** (torch.arange(0, dim, 2, dtype=torch.int64).float() / dim)
         )
-        inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        inv_freq_expanded = (
+            inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        )
         position_ids_expanded = position_ids[:, None, :].float()
         # Force float32 since bfloat16 loses precision on long contexts
         # See https://github.com/huggingface/transformers/pull/29285
-        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(
+            1, 2
+        )
         emb = torch.cat((freqs, freqs), dim=-1)
         cos = emb.cos()
         sin = emb.sin()
-        return torch.cat([cos, sin])#.transpose(0, 1) # [2, seq_len, dim] -> [seq_len, 2, dim]
+        return torch.cat(
+            [cos, sin]
+        )  # .transpose(0, 1) # [2, seq_len, dim] -> [seq_len, 2, dim]
 
     @staticmethod
     # Copied from transformers.models.llama.modeling_llama.apply_rotary_pos_emb
@@ -66,14 +73,17 @@ class Phi3_PositionalEmbeddings:
         k_embed = (k * cos) + (Phi3_PositionalEmbeddings.rotate_half(k) * sin)
         return q_embed, k_embed
 
+
 class LLAMA3_PositionalEmbeddings:
     @staticmethod
-    def precompute_rope_constants(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
+    def precompute_rope_constants(
+        dim: int, end: int, theta: float = 10000.0
+    ) -> torch.Tensor:
         """
         RoPE:
             - https://blog.eleuther.ai/rotary-embeddings/
             - https://github.com/meta-llama/llama3/blob/main/llama/model.py
-        """ 
+        """
         freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
         t = torch.arange(end, device=freqs.device, dtype=torch.float32)
         freqs = torch.outer(t, freqs)
@@ -94,11 +104,11 @@ class LLAMA3_PositionalEmbeddings:
             - https://github.com/meta-llama/llama3/blob/main/llama/model.py
         This function is taken and adapted from https://github.com/meta-llama/llama3/blob/main/llama/model.py
         It applies rotatory positional embedding to query and key vectors, performing only one reshape of rope frequencies.
-        """ 
-        #xq_shape = xq.shape
-        #xk_shape = xk.shape
-        #xq_ = torch.view_as_complex(xq.float().reshape(xq_shape[0], xq_shape[1], xq_shape[2], -1, 2))
-        #xk_ = torch.view_as_complex(xk.float().reshape(xk_shape[0], xk_shape[1], xk_shape[2], -1, 2))
+        """
+        # xq_shape = xq.shape
+        # xk_shape = xk.shape
+        # xq_ = torch.view_as_complex(xq.float().reshape(xq_shape[0], xq_shape[1], xq_shape[2], -1, 2))
+        # xk_ = torch.view_as_complex(xk.float().reshape(xk_shape[0], xk_shape[1], xk_shape[2], -1, 2))
         xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
         xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
         freqs_rope = reshape_for_broadcast(freqs_rope, xq_)

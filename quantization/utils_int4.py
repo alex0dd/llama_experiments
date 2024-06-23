@@ -1,15 +1,23 @@
 import torch
-from .utils import group_quantize_round_to_nearest, group_dequantize
+from torch import Tensor, uint8
+
+from .utils import (
+    _dynamically_quantize_per_channel,
+    group_dequantize,
+    group_quantize_round_to_nearest,
+)
 
 """
 Based on:
 https://github.com/pytorch-labs/gpt-fast/blob/main/quantize.py
 """
 
+
 def find_multiple(n: int, k: int) -> int:
     if n % k == 0:
         return n
     return n + k - (n % k)
+
 
 def get_group_qparams(w, n_bit=4, groupsize=128):
     # needed for GPTQ with padding
@@ -30,6 +38,7 @@ def get_group_qparams(w, n_bit=4, groupsize=128):
     return scales.to(torch.bfloat16).reshape(w.shape[0], -1), zeros.to(
         torch.bfloat16
     ).reshape(w.shape[0], -1)
+
 
 def pack_scales_and_zeros(scales, zeros):
     assert scales.shape == zeros.shape
@@ -89,17 +98,22 @@ def group_quantize_tensor(w, n_bit=4, groupsize=128):
     scales_and_zeros = pack_scales_and_zeros(scales, zeros)
     return w_int32, scales_and_zeros
 
+
 ##### weight only int4 per channel groupwise quantized code ######
+
 
 def prepare_int4_weight_and_scales_and_zeros(weight_bf16, groupsize, inner_k_tiles):
     # https://github.com/pytorch/pytorch/blob/5ffb032be682a34b959c82ce289b457ea6c6e504/aten/src/ATen/native/LinearAlgebra.cpp#L3476
     weight_int32, scales_and_zeros = group_quantize_tensor(
         weight_bf16, n_bit=4, groupsize=groupsize
     )
-    weight_int4pack = torch.ops.aten._convert_weight_to_int4pack(weight_int32, inner_k_tiles)
+    weight_int4pack = torch.ops.aten._convert_weight_to_int4pack(
+        weight_int32, inner_k_tiles
+    )
     return weight_int4pack, scales_and_zeros
 
-def _check_linear_int4_k(k, groupsize = 1, inner_k_tiles = 1):
+
+def _check_linear_int4_k(k, groupsize=1, inner_k_tiles=1):
     return k % groupsize == 0 and k % (inner_k_tiles * 16) == 0
 
 
@@ -114,15 +128,27 @@ def _check_linear_int4_k(k, groupsize = 1, inner_k_tiles = 1):
             self.weight, self.scales_and_zeros, self.out_features, self.groupsize
         )
 """
+
+
 def linear_forward_int4(x, weight_int4pack, scales_and_zeros, out_features, groupsize):
     origin_x_size = x.size()
     x = x.reshape(-1, origin_x_size[-1])
-    c = torch.ops.aten._weight_int4pack_mm(x, weight_int4pack, groupsize, scales_and_zeros)
+    c = torch.ops.aten._weight_int4pack_mm(
+        x, weight_int4pack, groupsize, scales_and_zeros
+    )
     new_shape = origin_x_size[:-1] + (out_features,)
     c = c.reshape(new_shape)
     return c
 
-def quantize_fp32_linear_to_int4(weight, layer_name, groupsize: int = 128, inner_k_tiles=8, padding=True, device="cpu"):
+
+def quantize_fp32_linear_to_int4(
+    weight,
+    layer_name,
+    groupsize: int = 128,
+    inner_k_tiles=8,
+    padding=True,
+    device="cpu",
+):
     # https://github.com/pytorch-labs/gpt-fast/blob/main/quantize.py#L396
     assert groupsize in [32, 64, 128, 256]
     assert inner_k_tiles in [2, 4, 8]
@@ -135,15 +161,20 @@ def quantize_fp32_linear_to_int4(weight, layer_name, groupsize: int = 128, inner
         if padding:
             print(f"warning: {layer_name} is padded to satisfy in_features % 1024 == 0")
             padded_in_features = find_multiple(in_features, 1024)
-            weight = torch.nn.functional.pad(weight, pad=(0, padded_in_features - in_features))
+            weight = torch.nn.functional.pad(
+                weight, pad=(0, padded_in_features - in_features)
+            )
         else:
-            print(f"warning: {layer_name} is skipped, int4 requires that in_features is 32, 64, or is divisible by 1024, " +
-        "and that groupsize and inner_k_tiles*16 evenly divide into it")
+            print(
+                f"warning: {layer_name} is skipped, int4 requires that in_features is 32, 64, or is divisible by 1024, "
+                + "and that groupsize and inner_k_tiles*16 evenly divide into it"
+            )
             return
     weight_int4pack, scales_and_zeros = prepare_int4_weight_and_scales_and_zeros(
         weight.to(torch.bfloat16).to(device=device), groupsize, inner_k_tiles
     )
     return weight_int4pack, scales_and_zeros
+
 
 ########
 # Adaptation of functions from https://github.com/mobiusml/hqq/
@@ -151,7 +182,7 @@ def quantize_fp32_linear_to_int4(weight, layer_name, groupsize: int = 128, inner
 
 # 4-bit
 ################################################
-from torch import Tensor, uint8
+
 
 def pack_4bit_u8_last_dim(W_q: Tensor) -> Tensor:  # uint8 > uint8/2
     W_q = W_q.to(uint8)
@@ -159,19 +190,24 @@ def pack_4bit_u8_last_dim(W_q: Tensor) -> Tensor:  # uint8 > uint8/2
 
     return (W_q[..., :_step] << 4) | W_q[..., _step:]
 
+
 @staticmethod
 def unpack_4bit_u8_last_dim(W_q: Tensor, dtype=uint8) -> Tensor:  # uint8/2 > uint8
     _step = W_q.shape[-1]
-    tmp = torch.empty(list(W_q.shape)[:-1] + [2 * _step], dtype=dtype, device=W_q.device)
+    tmp = torch.empty(
+        list(W_q.shape)[:-1] + [2 * _step], dtype=dtype, device=W_q.device
+    )
 
     tmp[..., :_step] = (W_q & 0b11110000) >> 4
     tmp[..., _step:] = W_q & 0b00001111
 
     return tmp
 
+
 """
 Layers operations
 """
+
 
 def quantize_pack_embedding_table(embedding_table, group_size=32):
     """
@@ -180,53 +216,77 @@ def quantize_pack_embedding_table(embedding_table, group_size=32):
     """
     n_bits = 4
     # TODO: check if we can use here the quantization function from int8, which doesn't return zeros but only scales
-    embedding_table_q, embedding_table_zero_points, embedding_table_scales = group_quantize_round_to_nearest(embedding_table, bits=n_bits, group_size=group_size)
+    embedding_table_q, embedding_table_zero_points, embedding_table_scales = (
+        group_quantize_round_to_nearest(
+            embedding_table, bits=n_bits, group_size=group_size
+        )
+    )
     packed_embedding_table_q = pack_4bit_u8_last_dim(embedding_table_q)
     return packed_embedding_table_q, embedding_table_zero_points, embedding_table_scales
 
 
-from .utils import _dynamically_quantize_per_channel
 def pack_4bit_int8_last_dim(W_q: Tensor) -> Tensor:  # int8 > int8/2
     W_q = W_q.to(torch.int8)
     _step = int(W_q.shape[-1] / 2)
     return (W_q[..., :_step] << 4) | W_q[..., _step:]
 
+
 def unpack_4bit_int8_last_dim(W_q: Tensor, dtype=torch.int8) -> Tensor:  # int8/2 > int8
     _step = W_q.shape[-1]
-    tmp = torch.empty(list(W_q.shape)[:-1] + [2 * _step], dtype=dtype, device=W_q.device)
+    tmp = torch.empty(
+        list(W_q.shape)[:-1] + [2 * _step], dtype=dtype, device=W_q.device
+    )
     tmp[..., :_step] = (W_q & 0b11110000) >> 4
     tmp[..., _step:] = W_q & 0b00001111
     return tmp
 
+
 def quantize_pack_embedding_table_v2(embedding_table):
-    int4_weight, scales, _ = _dynamically_quantize_per_channel(embedding_table.T.float(), -8, 7, torch.int8)
+    int4_weight, scales, _ = _dynamically_quantize_per_channel(
+        embedding_table.T.float(), -8, 7, torch.int8
+    )
     int4_weight = pack_4bit_int8_last_dim(int4_weight.T)
     return int4_weight, scales
 
-def lookup_on_quantized_and_packed_embedding_table(indices, embedding_table_q_p, embedding_table_zero_points, embedding_table_scales):
+
+def lookup_on_quantized_and_packed_embedding_table(
+    indices, embedding_table_q_p, embedding_table_zero_points, embedding_table_scales
+):
     indices_shape = list(indices.size())
     weights_shape = list(embedding_table_q_p.size()[1:])
 
     zeros_shape = list(embedding_table_zero_points.size()[1:])
     scales_shape = list(embedding_table_scales.size()[1:])
     # Selects rows using flattened indices, and reshapes to (B, S, Group, Hidden//Group//packing_factor)
-    selected_rows = torch.index_select(embedding_table_q_p, 0, indices.reshape(-1)).view(indices_shape + weights_shape)
+    selected_rows = torch.index_select(
+        embedding_table_q_p, 0, indices.reshape(-1)
+    ).view(indices_shape + weights_shape)
 
-    selected_zeros = torch.index_select(embedding_table_zero_points, 0, indices.reshape(-1)).view(indices_shape + zeros_shape)
-    selected_scales = torch.index_select(embedding_table_scales, 0, indices.reshape(-1)).view(indices_shape + scales_shape)
+    selected_zeros = torch.index_select(
+        embedding_table_zero_points, 0, indices.reshape(-1)
+    ).view(indices_shape + zeros_shape)
+    selected_scales = torch.index_select(
+        embedding_table_scales, 0, indices.reshape(-1)
+    ).view(indices_shape + scales_shape)
 
     # To avoid MPS error, we unpack on CPU
     orig_device = selected_rows.device
     selected_rows = unpack_4bit_u8_last_dim(selected_rows.to("cpu")).to(orig_device)
 
     # Results in shape (B, S, Group, Hidden//Group)
-    embedding_weights_dequant = group_dequantize(selected_rows, selected_zeros, selected_scales)
+    embedding_weights_dequant = group_dequantize(
+        selected_rows, selected_zeros, selected_scales
+    )
     # Reshape to (B, S, Hidden)
-    embedding_weights_dequant = embedding_weights_dequant.flatten(start_dim=-len(weights_shape))
+    embedding_weights_dequant = embedding_weights_dequant.flatten(
+        start_dim=-len(weights_shape)
+    )
 
     return embedding_weights_dequant
 
+
 ### Layers
+
 
 def embedding_int4(inputs, weights, scales, original_shape=None):
     embs = torch.nn.functional.embedding(inputs, weights)
@@ -238,7 +298,15 @@ def embedding_int4(inputs, weights, scales, original_shape=None):
     return out
 
 
-def linear_int4(inputs, weight, scales_and_zeros, original_shape, bias=None, groupsize=128, padding=True):
+def linear_int4(
+    inputs,
+    weight,
+    scales_and_zeros,
+    original_shape,
+    bias=None,
+    groupsize=128,
+    padding=True,
+):
     inputs = inputs.to(torch.bfloat16)
 
     out_features = original_shape[0]
@@ -249,10 +317,12 @@ def linear_int4(inputs, weight, scales_and_zeros, original_shape, bias=None, gro
     in_features = find_multiple(in_features, 1024)
 
     assert out_features % 8 == 0, "require out_features % 8 == 0"
-    
+
     # TODO: add behaviour if padding is needed (https://github.com/pytorch-labs/gpt-fast/blob/main/quantize.py#L483-L525)
     if padding:
-        input = torch.nn.functional.pad(inputs, pad=(0, in_features - origin_in_features))
+        inputs = torch.nn.functional.pad(
+            inputs, pad=(0, in_features - origin_in_features)
+        )
     out = linear_forward_int4(inputs, weight, scales_and_zeros, out_features, groupsize)
     if bias is not None:
         out += bias
