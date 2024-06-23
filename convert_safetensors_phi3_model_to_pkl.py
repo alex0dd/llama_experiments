@@ -13,7 +13,7 @@ from ops.utils import load_multiple_transformer_block_weights_and_remap
 from quantization.utils_int4 import quantize_fp32_linear_to_int4, quantize_pack_embedding_table_v2
 from quantization.utils_int8 import quantize_fp32_linear_to_int8
 
-from utils.utils import load_json
+from utils.utils import get_all_safetensors_model_files, load_json
 
 def is_linear_weight(layer_name):
     return "mlp." in layer_name and ".weight" in layer_name
@@ -84,7 +84,7 @@ def quantize_all_mlps(blocks_chunk, quant_type="int8", device="cpu"):
 
 def parse_all_args():
     # Create the argument parser
-    arg_parser = argparse.ArgumentParser(description="Parse quantization type argument.")
+    arg_parser = argparse.ArgumentParser(description="Conversion script arguments.")
     arg_parser.add_argument(
         "--quantization_type",
         type=str,
@@ -99,6 +99,18 @@ def parse_all_args():
         default="cpu",
         help="Specify the device: cpu or cuda. Defaults to 'cpu' if not specified."
     )
+    arg_parser.add_argument(
+        "--base_model_dir",
+        type=str,
+        default="Phi-3-mini-4k-instruct",
+        help="Specify the path of base model directory containing Phi3. Defaults to 'Phi-3-mini-4k-instruct' if not specified."
+    )
+    arg_parser.add_argument(
+        "--output_model_dir",
+        type=str,
+        default="PHI3-MINI-4K-PKL",
+        help="Specify the path of the output model directory that will contain the converted checkpoint. Defaults to 'PHI3-MINI-4K-PKL'+quantization_type if not specified."
+    )
     
     # Parse the arguments
     args = arg_parser.parse_args()
@@ -110,21 +122,20 @@ print(args)
 quantization_type = args.quantization_type
 device = args.device
 
-base_model_dir = "Phi-3-mini-4k-instruct"
+base_model_dir = args.base_model_dir
+output_model_dir = args.output_model_dir
 
-model_parser = ModelParser([
-    f"./{base_model_dir}/model-00001-of-00002.safetensors",
-    f"./{base_model_dir}/model-00002-of-00002.safetensors",
-])
+model_files = get_all_safetensors_model_files(base_model_dir)
+model_parser = ModelParser(model_files)
 config = load_json(f"./{base_model_dir}/config.json")
 
-converted_model_path = "PHI3-MINI-4K-PKL"+("" if not quantization_type else f"-{quantization_type}")
+converted_model_path = output_model_dir+("" if not quantization_type else f"-{quantization_type}")
 
 if not os.path.exists(converted_model_path):
     os.makedirs(converted_model_path)
 
-num_layers = config["num_hidden_layers"]
-preload_n_transformer_blocks = 50 # TODO: remove this later
+num_layers = int(config["num_hidden_layers"])
+preload_n_transformer_blocks = num_layers # preload all (since we're dealing with not so big models)
 
 current_transformer_blocks_loaded = None
 layer_idxs_to_load = []

@@ -41,7 +41,7 @@ def quantize_all_mlps(blocks_chunk, quant_type="int8", device="cpu"):
 
 def parse_all_args():
     # Create the argument parser
-    arg_parser = argparse.ArgumentParser(description="Parse quantization type argument.")
+    arg_parser = argparse.ArgumentParser(description="Conversion script arguments.")
     arg_parser.add_argument(
         "--quantization_type",
         type=str,
