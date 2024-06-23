@@ -13,9 +13,9 @@ python -m cProfile -s time run_model.py > profile.text 2>&1
 ```
 
 ```
-python convert_safetensors_llama3_model_to_pkl.py --quantization_type int8
-python convert_safetensors_phi3_model_to_pkl.py --quantization_type int8
-python convert_safetensors_llama3_model_to_pkl.py --quantization_type int8 --base_model_dir Mistral-7B-Instruct-v0.3 --output_model_dir MISTRAL-7B-PKL
+python -m conversion_scripts.convert_safetensors_llama3_model_to_pkl.py --quantization_type int8
+python -m conversion_scripts.convert_safetensors_phi3_model_to_pkl.py --quantization_type int8
+python -m conversion_scripts.convert_safetensors_llama3_model_to_pkl.py --quantization_type int8 --base_model_dir Mistral-7B-Instruct-v0.3 --output_model_dir MISTRAL-7B-PKL
 ```
 
 ## Supported and tested models
