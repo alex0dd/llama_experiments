@@ -113,7 +113,7 @@ def generate_text_stream(model, tokenizer, input_ids, max_gen_len, pad_id=None, 
     total_len = min(max_seq_len, max_gen_len + max_prompt_len)
 
     try:
-        pad_id = tokenizer.eos_id
+        pad_id = tokenizer.eos_token_id
     except:
         pad_id = pad_id
     batch_size = len(input_ids)

@@ -53,31 +53,27 @@ def get_all_layer_names_in_block(layer_idx: int, config) -> Dict[str, str]:
     Returns a dictionary with keys being layer names for a given transformer block
     in HF format and values being their mapping to be used within Transformer model.
     """
+    weight_remap = {}
     if config["model_type"] == "phi3":
         attn_letters = ['o', 'qkv']
-        weight_remap = {
-            f'model.layers.{layer_idx}.mlp.down_proj.weight': 'mlp.down_proj.weight',
-            f'model.layers.{layer_idx}.mlp.gate_up_proj.weight': 'mlp.gate_up_proj.weight',
-            f'model.layers.{layer_idx}.input_layernorm.weight': 'input_layernorm.weight',
-            f'model.layers.{layer_idx}.post_attention_layernorm.weight': 'post_attention_layernorm.weight'
-        }
+        mlp_names = ['down_proj', 'gate_up_proj']
     else:
-        attn_letters = ['q', 'k', 'v', 'o'] 
-        weight_remap = {
-            f'model.layers.{layer_idx}.mlp.down_proj.weight': 'mlp.down_proj.weight',
-            f'model.layers.{layer_idx}.mlp.gate_proj.weight': 'mlp.gate_proj.weight',
-            f'model.layers.{layer_idx}.mlp.up_proj.weight': 'mlp.up_proj.weight',
-            f'model.layers.{layer_idx}.input_layernorm.weight': 'input_layernorm.weight',
-            f'model.layers.{layer_idx}.post_attention_layernorm.weight': 'post_attention_layernorm.weight'
-        }
-    
+        attn_letters = ['q', 'k', 'v', 'o']
+        mlp_names = ['down_proj', 'gate_proj', 'up_proj']
+    norm_names = ['input_layernorm', 'post_attention_layernorm']
     for letter in attn_letters:
-        orig_key = f'model.layers.{layer_idx}.self_attn.{letter}_proj.weight'
-        new_key = f'self_attn.{letter}_proj.weight'
-        weight_remap[orig_key] = new_key
+        weight_remap[f'model.layers.{layer_idx}.self_attn.{letter}_proj.weight'] = f'self_attn.{letter}_proj.weight'
+        if "attention_bias" in config and config["attention_bias"]:
+            weight_remap[f'model.layers.{layer_idx}.self_attn.{letter}_proj.bias'] = f'self_attn.{letter}_proj.bias'
+    for mlp in mlp_names:
+        weight_remap[f'model.layers.{layer_idx}.mlp.{mlp}.weight'] = f'mlp.{mlp}.weight'
+        if "mlp_bias" in config and config["mlp_bias"]:
+            weight_remap[f'model.layers.{layer_idx}.mlp.{mlp}.bias'] = f'mlp.{mlp}.bias'
+    for norm in norm_names:
+        weight_remap[f'model.layers.{layer_idx}.{norm}.weight'] = f'{norm}.weight'
     return weight_remap
 
-def load_multiple_transformer_block_weights_and_remap(parser, config, layer_idxs, device):
+def load_multiple_transformer_block_weights_and_remap(parser, config, layer_idxs, device, disable_llama_qk_remap=False):
     """
     Helper function that loads all the weights for given transformer block indices minimizing
     the number of file reads, and transfers them to the given decide.
@@ -97,7 +93,10 @@ def load_multiple_transformer_block_weights_and_remap(parser, config, layer_idxs
         layer_idx = int(weight_name.split(".")[2])
         remapped_weight_name = all_weights_remap[weight_name]
         # Move the original loaded weight with original weight name, into the loaded_weights dict (and repermute it if needed, e.g. in attn q, k cases)
-        final_weights = remap_weights_if_needed(all_loaded_weights[weight_name], weight_name, config)
+        if not disable_llama_qk_remap:
+            final_weights = remap_weights_if_needed(all_loaded_weights[weight_name], weight_name, config)
+        else:
+            final_weights = all_loaded_weights[weight_name]
         loaded_weights[layer_idx][remapped_weight_name] = final_weights.to(device)         
     return loaded_weights
 

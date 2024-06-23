@@ -238,7 +238,7 @@ def embedding_int4(inputs, weights, scales, original_shape=None):
     return out
 
 
-def linear_int4(inputs, weight, scales_and_zeros, original_shape, groupsize=128, padding=True):
+def linear_int4(inputs, weight, scales_and_zeros, original_shape, bias=None, groupsize=128, padding=True):
     inputs = inputs.to(torch.bfloat16)
 
     out_features = original_shape[0]
@@ -253,4 +253,7 @@ def linear_int4(inputs, weight, scales_and_zeros, original_shape, groupsize=128,
     # TODO: add behaviour if padding is needed (https://github.com/pytorch-labs/gpt-fast/blob/main/quantize.py#L483-L525)
     if padding:
         input = torch.nn.functional.pad(inputs, pad=(0, in_features - origin_in_features))
-    return linear_forward_int4(inputs, weight, scales_and_zeros, out_features, groupsize)
+    out = linear_forward_int4(inputs, weight, scales_and_zeros, out_features, groupsize)
+    if bias is not None:
+        out += bias
+    return out

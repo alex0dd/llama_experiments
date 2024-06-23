@@ -14,9 +14,14 @@ def embedding_matrix(inputs, weights, scales=None, original_shape=None):
     # https://pytorch.org/docs/stable/generated/torch.nn.functional.embedding.html
     return torch.nn.functional.embedding(inputs, weights)
 
+def linear_default(inputs, weight, scales=None, bias=None, original_shape=None):
+    out = torch.nn.functional.linear(inputs, weight.to(dtype=inputs.dtype), bias=bias)
+    return out
+
 linears = {
     "int4": linear_int4,
-    "int8": linear_int8
+    "int8": linear_int8,
+    "default": linear_default
 }
 embeddings = {
     "default": embedding_matrix,
@@ -29,13 +34,30 @@ embedding_quantized = embeddings[prec]
 
 @torch.inference_mode()
 def functional_ffn_quantized(x: torch.Tensor, weights: Dict[str, torch.Tensor]):
-    output = linear_quantized(x, weights["mlp.gate_proj.weight"], weights["mlp.gate_proj.weight_scales"], weights["mlp.gate_proj.weight_orig_shape"])
-    output = torch.nn.functional.silu(output) * linear_quantized(x, weights["mlp.up_proj.weight"], weights["mlp.up_proj.weight_scales"], weights["mlp.up_proj.weight_orig_shape"])
-    output = linear_quantized(output, weights["mlp.down_proj.weight"], weights["mlp.down_proj.weight_scales"], weights["mlp.down_proj.weight_orig_shape"])
+    output = linear_quantized(
+        x,
+        weights["mlp.gate_proj.weight"], 
+        weights.get("mlp.gate_proj.weight_scales"), 
+        original_shape=weights.get("mlp.gate_proj.weight_orig_shape"),
+        bias=weights.get("mlp.gate_proj.bias")
+    )
+    output = torch.nn.functional.silu(output) * linear_quantized(
+        x, weights["mlp.up_proj.weight"], 
+        weights.get("mlp.up_proj.weight_scales"), 
+        original_shape=weights.get("mlp.up_proj.weight_orig_shape"),
+        bias=weights.get("mlp.up_proj.bias")
+    )
+    output = linear_quantized(
+        output, weights["mlp.down_proj.weight"], 
+        weights.get("mlp.down_proj.weight_scales"), 
+        original_shape=weights.get("mlp.down_proj.weight_orig_shape"),
+        bias=weights.get("mlp.down_proj.bias")
+    )
     return output
 
 @torch.inference_mode()
 def functional_ffn_phi3_quantized(x: torch.Tensor, weights: Dict[str, torch.Tensor]):
+    # TODO: refactor this with weights.get
     up_states = linear_quantized(x, weights["mlp.gate_up_proj.weight"], weights["mlp.gate_up_proj.weight_scales"], weights["mlp.gate_up_proj.weight_orig_shape"])
     gate, up_states = up_states.chunk(2, dim=-1)
     up_states = torch.nn.functional.silu(gate) * up_states
@@ -88,10 +110,25 @@ def functional_gqa_quantized(
     bs, seq_len, _ = x.shape
     # Apply attention transformation matrices
     # (BS, S, dim) -> (BS, S, n_heads * head_dim)
-    xq = linear_quantized(x, weights["self_attn.q_proj.weight"], weights["self_attn.q_proj.weight_scales"], weights["self_attn.q_proj.weight_orig_shape"])
+    xq = linear_quantized(
+        x, weights["self_attn.q_proj.weight"], 
+        weights.get("self_attn.q_proj.weight_scales"), 
+        original_shape=weights.get("self_attn.q_proj.weight_orig_shape"),
+        bias=weights.get("self_attn.q_proj.bias")
+    )
     # (BS, S, dim) -> (BS, S, n_kv_heads * head_dim)
-    xk = linear_quantized(x, weights["self_attn.k_proj.weight"], weights["self_attn.k_proj.weight_scales"], weights["self_attn.k_proj.weight_orig_shape"])
-    xv = linear_quantized(x, weights["self_attn.v_proj.weight"], weights["self_attn.v_proj.weight_scales"], weights["self_attn.v_proj.weight_orig_shape"])
+    xk = linear_quantized(
+        x, weights["self_attn.k_proj.weight"], 
+        weights.get("self_attn.k_proj.weight_scales"), 
+        original_shape=weights.get("self_attn.k_proj.weight_orig_shape"),
+        bias=weights.get("self_attn.k_proj.bias")
+    )
+    xv = linear_quantized(
+        x, weights["self_attn.v_proj.weight"], 
+        weights.get("self_attn.v_proj.weight_scales"), 
+        original_shape=weights.get("self_attn.v_proj.weight_orig_shape"),
+        bias=weights.get("self_attn.v_proj.bias")
+    )
     # Reshapes
     # (BS, S, n_heads * head_dim) -> (BS, S, n_heads, head_dim)
     xq = xq.view(bs, seq_len, n_heads, head_dim)
@@ -99,7 +136,7 @@ def functional_gqa_quantized(
     xk = xk.view(bs, seq_len, n_kv_heads, head_dim)
     xv = xv.view(bs, seq_len, n_kv_heads, head_dim)
     # Apply positional embeddings
-    if model_type == "phi3":
+    if model_type == "phi3" or model_type == "granite-small":
         xq, xk = Phi3_PositionalEmbeddings.apply_rotary_emb(xq, xk, cos=freqs_rope[0], sin=freqs_rope[1])
     else:
         xq, xk = LLAMA3_PositionalEmbeddings.apply_rotary_emb(xq, xk, freqs_rope)
@@ -131,7 +168,12 @@ def functional_gqa_quantized(
         output = torch.nn.functional.scaled_dot_product_attention(xq, keys, values, attn_mask=mask, dropout_p=0.0)
         # # (BS, n_heads, S, head_dim) -> (BS, S, n_heads, head_dim) -> (BS, S, n_heads * head_dim)
         output = output.transpose(1, 2).contiguous().view(bs, seq_len, -1)
-    output = linear_quantized(output, weights["self_attn.o_proj.weight"], weights["self_attn.o_proj.weight_scales"], weights["self_attn.o_proj.weight_orig_shape"])
+    output = linear_quantized(
+        output, weights["self_attn.o_proj.weight"], 
+        weights.get("self_attn.o_proj.weight_scales"), 
+        original_shape=weights.get("self_attn.o_proj.weight_orig_shape"),
+        bias=weights.get("self_attn.o_proj.bias")
+    )
     return output
 
 def functional_transformer_block(x: torch.Tensor, weights, cache_k, cache_v, start_pos: int, freqs_rope: torch.Tensor, config, mask: Optional[torch.Tensor]):
@@ -157,6 +199,11 @@ def move_to_device(block_chunk, device):
             if not layer_name.endswith("_orig_shape"):
                 block_chunk[layer_idx][layer_name] = block_chunk[layer_idx][layer_name].to(device)
 
+def move_to_device_general(general, device):
+    for layer_name in general.keys():
+            if not layer_name.endswith("_orig_shape"):
+                general[layer_name] = general[layer_name].to(device)
+
 class Transformer:
     def __init__(self, model_dir, config, device="cpu"):
         model_dir = model_dir
@@ -168,7 +215,7 @@ class Transformer:
                 self.config["max_position_embeddings"]* 2,
                 self.config["rope_theta"],
             ).to(self.device)
-        elif self.config["model_type"] == "phi3":
+        elif self.config["model_type"] == "phi3" or self.config["model_type"] == "granite-small":
             position_ids = torch.arange(
                 0, self.config["max_position_embeddings"], dtype=torch.long
             )
@@ -186,8 +233,11 @@ class Transformer:
         self.chunk_weights = load_block_chunk(model_dir, 0) # assume all weights are in single chunk
         move_to_device(self.chunk_weights, self.device)
         self.general_chunk_weights = load_general_chunk(model_dir)
+        move_to_device_general(self.general_chunk_weights, self.device)
         
         # TODO: simplify this behavior (tie embeddings + scales/shapes assigning)
+        # TODO: create a dict with general weights to pass around
+        """
         self.embedding_weights = self.general_chunk_weights['model.embed_tokens.weight'].to(self.device)
         if 'model.embed_tokens.weight_scales' in self.general_chunk_weights:
             self.embedding_weights_scales = self.general_chunk_weights['model.embed_tokens.weight_scales'].to(self.device)
@@ -195,8 +245,9 @@ class Transformer:
             self.embedding_weights_scales = None
         
         if config["tie_word_embeddings"]:
-            self.output_embedding_weights = self.embedding_weights
+            self.output_embedding_weights = self.embedding_weights.T
             self.output_embedding_scales = self.embedding_weights_scales
+            self.output_embedding_orig_shape = None
         else:
             self.output_embedding_weights = self.general_chunk_weights['lm_head.weight'].to(self.device)
             if 'lm_head.weight_scales' in self.general_chunk_weights:
@@ -208,6 +259,9 @@ class Transformer:
             else:
                 self.output_embedding_orig_shape = None
         self.output_norm_weights = self.general_chunk_weights['model.norm.weight'].to(self.device)
+        """
+        if config["tie_word_embeddings"]:
+            self.general_chunk_weights['lm_head.weight'] = self.general_chunk_weights['model.embed_tokens.weight']
 
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
@@ -215,8 +269,11 @@ class Transformer:
         # all blocks O(0.25)s
         # head 0(0.0001)s
         seq_len = tokens.shape[-1]
-        seq_embeddings = embedding_quantized(tokens, self.embedding_weights, self.embedding_weights_scales)
-        if self.config["model_type"] == "phi3":
+        seq_embeddings = embedding_quantized(
+            tokens, self.general_chunk_weights['model.embed_tokens.weight'], 
+            scales=self.general_chunk_weights.get('model.embed_tokens.weight_scales')
+        )
+        if self.config["model_type"] == "phi3" or self.config["model_type"] == "granite-small":
             freqs_rope = self.freqs_rope[:, start_pos : start_pos + seq_len]
         else:
             freqs_rope = self.freqs_rope[start_pos : start_pos + seq_len]
@@ -227,6 +284,10 @@ class Transformer:
             cache_v = self.caches_memory[layer_idx]["v"]
             block_weights = self.chunk_weights[layer_idx]
             h = functional_transformer_block(h, block_weights, cache_k, cache_v, start_pos, freqs_rope, self.config, mask)
-        h = functional_rmsnorm(h, self.output_norm_weights)
-        output = linear_quantized(h, self.output_embedding_weights, self.output_embedding_scales, self.output_embedding_orig_shape).float()
+        h = functional_rmsnorm(h, self.general_chunk_weights['model.norm.weight'])
+        output = linear_quantized(
+            h, self.general_chunk_weights.get('lm_head.weight'), 
+            scales=self.general_chunk_weights.get('lm_head.weight_scales'), 
+            original_shape=self.general_chunk_weights.get('lm_head.weight_orig_shape')
+        ).float()
         return output
