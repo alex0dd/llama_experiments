@@ -162,7 +162,7 @@ class Transformer:
         model_dir = model_dir
         self.config = config
         self.device=device
-        if self.config["model_type"] == "llama":
+        if self.config["model_type"] == "llama" or self.config["model_type"] == "mistral":
             self.freqs_rope = LLAMA3_PositionalEmbeddings.precompute_rope_constants(
                 self.config["hidden_size"] // self.config["num_attention_heads"],
                 self.config["max_position_embeddings"]* 2,

@@ -1,6 +1,7 @@
 import math
 import struct
 import json
+import os
 
 import numpy as np
 try:
@@ -71,3 +72,11 @@ def load_json(file_path):
     with open(file_path, 'r') as file:
         config = json.load(file)
     return config
+
+def get_all_safetensors_model_files(model_dir):
+    all_safetensors = []
+    files_in_dir = os.listdir(model_dir)
+    for file in files_in_dir:
+        if file.endswith(".safetensors"):
+            all_safetensors.append(os.path.join(model_dir, file))
+    return all_safetensors

@@ -26,7 +26,7 @@ def sample_top_p(probs, p):
     next_token = torch.gather(probs_idx, -1, next_token)
     return next_token
 
-def generate_text(model, tokenizer, input_ids, max_gen_len, temperature=0.6, top_p=0.9, stop_tokens_ids=None, streaming=False, echo=False):
+def generate_text(model, tokenizer, input_ids, max_gen_len, pad_id=None, temperature=0.6, top_p=0.9, stop_tokens_ids=None, streaming=False, echo=False):
     """
     If temperature > 0, then top_p is used for sampling.
     """
@@ -37,7 +37,10 @@ def generate_text(model, tokenizer, input_ids, max_gen_len, temperature=0.6, top
     assert max_prompt_len <= max_seq_len
     total_len = min(max_seq_len, max_gen_len + max_prompt_len)
 
-    pad_id = tokenizer.eos_token_id
+    try:
+        pad_id = tokenizer.eos_id
+    except:
+        pad_id = pad_id
     batch_size = len(input_ids)
     prev_pos = 0
     
@@ -98,7 +101,7 @@ def generate_text(model, tokenizer, input_ids, max_gen_len, temperature=0.6, top
     return decoded_tokens, total_tokens_count
 
 
-def generate_text_stream(model, tokenizer, input_ids, max_gen_len, temperature=0.6, top_p=0.9, stop_tokens_ids=None, stream_interval=4):
+def generate_text_stream(model, tokenizer, input_ids, max_gen_len, pad_id=None, temperature=0.6, top_p=0.9, stop_tokens_ids=None, stream_interval=4):
     """
     If temperature > 0, then top_p is used for sampling.
     """
@@ -109,7 +112,10 @@ def generate_text_stream(model, tokenizer, input_ids, max_gen_len, temperature=0
     assert max_prompt_len <= max_seq_len
     total_len = min(max_seq_len, max_gen_len + max_prompt_len)
 
-    pad_id = tokenizer.eos_token_id
+    try:
+        pad_id = tokenizer.eos_id
+    except:
+        pad_id = pad_id
     batch_size = len(input_ids)
     prev_pos = 0
     
