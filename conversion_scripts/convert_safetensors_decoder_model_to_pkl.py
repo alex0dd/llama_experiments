@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import pickle
 import shutil
@@ -261,6 +262,17 @@ with open(os.path.join(output_model_dir, "general_chunk.pkl"), "wb") as f:
 
 # Copy config file
 shutil.copy2(config_file_path, output_model_dir)
+config_fpath = os.path.join(output_model_dir, "config.json")
+# Modify the config file to include conversion data
+with open(config_fpath, "r") as file:
+    data = json.load(file)
+
+data["conversion_config"] = {
+    "precision": "default" if not quantization_type else quantization_type
+}
+
+with open(config_fpath, "w") as file:
+    json.dump(data, file, indent=4)
 # Copy all tokenizer files
 tokenizer_files = get_all_keyword_files(base_model_dir, "token", mode="contains")
 for f in tokenizer_files:
