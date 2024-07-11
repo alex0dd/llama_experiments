@@ -235,27 +235,29 @@ if quantization_type and quantize_embeddings:
 else:
     general_chunk_dict["model.embed_tokens.weight"] = embedding_weights.to(device)
 
-# TODO: fix bug where with non tied word embeddings, we can't use weight_scales from embed_tokens, because they have hidden_dim shape and not vocab shape
-
 if not tie_word_embeddings:
     output_embedding_weights = model_parser.get_tensor("lm_head.weight")
-    if quantization_type:
-        orig_shapes = output_embedding_weights.shape
-        if quantization_type == "int8":
-            output_embedding_weights, output_embedding_scales = (
-                quantize_fp32_linear_to_int8(output_embedding_weights)
+else:
+    # We'll still need to quantize the output embedding weights, even if tied.
+    output_embedding_weights = embedding_weights
+
+if quantization_type:
+    orig_shapes = output_embedding_weights.shape
+    if quantization_type == "int8":
+        output_embedding_weights, output_embedding_scales = (
+            quantize_fp32_linear_to_int8(output_embedding_weights)
+        )
+    elif quantization_type == "int4":
+        output_embedding_weights, output_embedding_scales = (
+            quantize_fp32_linear_to_int4(
+                output_embedding_weights, "lm_head.weight", device=device
             )
-        elif quantization_type == "int4":
-            output_embedding_weights, output_embedding_scales = (
-                quantize_fp32_linear_to_int4(
-                    output_embedding_weights, "lm_head.weight", device=device
-                )
-            )
-        general_chunk_dict["lm_head.weight"] = output_embedding_weights.to(device)
-        general_chunk_dict["lm_head.weight_scales"] = output_embedding_scales.to(device)
-        general_chunk_dict["lm_head.weight_orig_shape"] = orig_shapes
-    else:
-        general_chunk_dict["lm_head.weight"] = output_embedding_weights.to(device)
+        )
+    general_chunk_dict["lm_head.weight"] = output_embedding_weights.to(device)
+    general_chunk_dict["lm_head.weight_scales"] = output_embedding_scales.to(device)
+    general_chunk_dict["lm_head.weight_orig_shape"] = orig_shapes
+else:
+    general_chunk_dict["lm_head.weight"] = output_embedding_weights.to(device)
 
 with open(os.path.join(output_model_dir, "general_chunk.pkl"), "wb") as f:
     pickle.dump(general_chunk_dict, f)

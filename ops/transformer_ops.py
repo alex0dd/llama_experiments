@@ -318,10 +318,6 @@ class Transformer:
         self.general_chunk_weights = load_general_chunk(model_dir)
         move_to_device_recursive(self.chunk_weights, self.device)
         move_to_device_recursive(self.general_chunk_weights, self.device)
-        if config["tie_word_embeddings"]:
-            self.general_chunk_weights["lm_head.weight"] = self.general_chunk_weights[
-                "model.embed_tokens.weight"
-            ]
 
         self.conversion_config = self.config.get("conversion_config", {})
         self.precision = self.conversion_config.get("precision", "default")
