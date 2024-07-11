@@ -22,9 +22,9 @@ python -m conversion_scripts.convert_safetensors_decoder_model_to_pkl --quantiza
 python -m conversion_scripts.convert_safetensors_decoder_model_to_pkl --base_model_dir original_models/granite-3b-code-instruct --output_model_dir converted_models/GRANITE-3B-CODE-INSTRUCT-PKL --disable-llama-qk-remap
 
 python -m conversion_scripts.convert_safetensors_decoder_model_to_pkl --base_model_dir original_models/granite-3b-code-instruct --output_model_dir converted_models/GRANITE-3B-CODE-INSTRUCT-PKL --quantization_type int8 --no-quantize_embeddings --disable-llama-qk-remap
-```
 
-Unquantized versions will run faster, as they won't have the rescaling and casting overheads.
+python -m conversion_scripts.convert_safetensors_decoder_model_to_pkl --base_model_dir original_models/granite-8b-code-instruct --output_model_dir converted_models/GRANITE-8B-CODE-INSTRUCT-PKL --quantization_type int8 --no-quantize_embeddings --disable-llama-qk-remap
+```
 
 ## Supported and tested models
 
@@ -33,6 +33,7 @@ The following models have been converted, quantized to at least int8 and tested 
 * [Phi3-mini-4k](https://huggingface.co/microsoft/Phi-3-mini-4k-instruct)
 * [Mistral-7B-Instruct-v0.3](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3)
 * [Granite-3b Base](https://huggingface.co/ibm-granite/granite-3b-code-base) and [Granite-3b Instruct](https://huggingface.co/ibm-granite/granite-3b-code-instruct)
+* [Granite-8b Base](https://huggingface.co/ibm-granite/granite-8b-code-base) and [Granite-8b Instruct](https://huggingface.co/ibm-granite/granite-8b-code-instruct)
 
 
 ## Misc Resources
