@@ -128,6 +128,13 @@ def parse_all_args():
         help="Specify the path of the output model directory that will contain the converted checkpoint. Defaults to 'LLAMA3-8B-PKL'+quantization_type if not specified.",
     )
     arg_parser.add_argument(
+        "--custom_model_type",
+        type=str,
+        choices=["granite-small", None],
+        default=None,
+        help="Define custom model type for conversion. Defaults to None if not specified. For Granite3B/8B models, this should be set to 'granite-small'.",
+    )
+    arg_parser.add_argument(
         "--max_seq_len",
         type=int,
         default=None,
@@ -158,6 +165,7 @@ quantization_type = args.quantization_type
 device = args.device
 quantize_embeddings = args.quantize_embeddings
 disable_llama_qk_remap = args.disable_llama_qk_remap
+custom_model_type = args.custom_model_type
 
 base_model_dir = args.base_model_dir
 output_model_dir = args.output_model_dir
@@ -272,6 +280,9 @@ with open(config_fpath, "r") as file:
 data["conversion_config"] = {
     "precision": "default" if not quantization_type else quantization_type
 }
+
+if custom_model_type:
+    data["model_type"] = custom_model_type
 
 with open(config_fpath, "w") as file:
     json.dump(data, file, indent=4)
