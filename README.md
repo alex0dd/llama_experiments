@@ -60,7 +60,7 @@ python -m example_notebooks.model_runner --model-dir ${PWD}/converted_models/LLA
 
 python -m example_notebooks.model_runner --model-dir ${PWD}/converted_models/LLAMA-3.1-8B-PKL-int8 --interaction-type completion
 
-python -m example_notebooks.model_runner --model-dir ${PWD}/converted_models/LLAMA-3.1-8B-INSTRUCT-PKL-int8
+python -m example_notebooks.model_runner --model-dir ${PWD}/converted_models/LLAMA-3.1-8B-INSTRUCT-PKL-int8 --max-gen-len 4096
 ```
 
 ## Supported and tested models

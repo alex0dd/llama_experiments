@@ -135,7 +135,7 @@ def parse_all_args():
         help="Define custom model type for conversion. Defaults to None if not specified. For Granite3B/8B models, this should be set to 'granite-small'.",
     )
     arg_parser.add_argument(
-        "--max_seq_len",
+        "--max-seq-len",
         type=int,
         default=None,
         help="If specified, this maximum sequence length will be used for the conversion.",
@@ -166,6 +166,7 @@ device = args.device
 quantize_embeddings = args.quantize_embeddings
 disable_llama_qk_remap = args.disable_llama_qk_remap
 custom_model_type = args.custom_model_type
+max_seq_len = int(args.max_seq_len) if args.max_seq_len else None
 
 base_model_dir = args.base_model_dir
 output_model_dir = args.output_model_dir
@@ -174,7 +175,9 @@ config_file_path = f"./{base_model_dir}/config.json"
 model_files = get_all_keyword_files(base_model_dir, "safetensors", mode="endswith")
 model_parser = ModelParser(model_files)
 config = load_json(config_file_path)
-config["max_position_embeddings"] = 2048
+if max_seq_len:
+    assert max_seq_len <= config["max_position_embeddings"], "max-seq-len must be less than or equal to the original model's max_position_embeddings"
+    config["max_position_embeddings"] = max_seq_len
 tie_word_embeddings = config["tie_word_embeddings"]
 
 output_model_dir = output_model_dir + (

@@ -78,17 +78,20 @@ terminators = [
 print("[STATUS] Model and tokenizer loaded successfully.")
 
 is_chat = interaction_type == "chat"
-
 if is_chat:
     chat_history = []
 user_input_text = input("User: ").strip()
 while user_input_text != "/exit":
     if is_chat:
-        chat_history.append(
-            { "role": "user", "content": user_input_text }
-        )
-        input_ids = tokenizer.apply_chat_template(chat_history, tokenize=True, add_generation_prompt=True)
-        input_ids = [input_ids]
+        if user_input_text == "/drop_history":
+            chat_history = []
+            print("[STATUS] Chat history dropped.")
+            user_input_text = input("User: ").strip()
+            continue
+        else:
+            chat_history.append({"role": "user", "content": user_input_text})
+            input_ids = tokenizer.apply_chat_template(chat_history, tokenize=True, add_generation_prompt=True)
+            input_ids = [input_ids]
     else:
         input_ids = text_to_ids(user_input_text, tokenizer)
     output_text = []
