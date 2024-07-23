@@ -56,11 +56,11 @@ python -m conversion_scripts.convert_safetensors_decoder_model_to_pkl --base_mod
 ## Running models
 
 ```
-python -m example_notebooks.model_runner --model_dir ${PWD}/converted_models/LLAMA-3-8B-INSTRUCT-PKL-int8 --interaction_type chat
+python -m example_notebooks.model_runner --model-dir ${PWD}/converted_models/LLAMA-3-8B-INSTRUCT-PKL-int8 --interaction-type chat
 
-python -m example_notebooks.model_runner --model_dir ${PWD}/converted_models/LLAMA-3.1-8B-PKL-int8 --interaction_type completion
+python -m example_notebooks.model_runner --model-dir ${PWD}/converted_models/LLAMA-3.1-8B-PKL-int8 --interaction-type completion
 
-python -m example_notebooks.model_runner --model_dir ${PWD}/converted_models/LLAMA-3.1-8B-INSTRUCT-PKL-int8
+python -m example_notebooks.model_runner --model-dir ${PWD}/converted_models/LLAMA-3.1-8B-INSTRUCT-PKL-int8
 ```
 
 ## Supported and tested models
