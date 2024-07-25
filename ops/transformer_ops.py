@@ -6,9 +6,10 @@ from quantization.utils_int4 import embedding_int4, linear_int4
 from quantization.utils_int8 import embedding_int8, linear_int8
 
 from .rope import LLAMA3_PositionalEmbeddings, Phi3_PositionalEmbeddings
+from .kv_cache_ops import build_kv_caches, KVCache
+
 from .utils import (
     build_attention_mask,
-    build_kv_caches,
     load_block_chunk,
     load_general_chunk,
     repeat_kv,
@@ -144,10 +145,9 @@ class WeightlessGQA(torch.nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        start_pos: int,
+        input_pos: int,
         weights: Dict[str, torch.Tensor],
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
+        kv_cache: torch.nn.Module,
         freqs_rope: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
@@ -186,16 +186,8 @@ class WeightlessGQA(torch.nn.Module):
         else:
             xq, xk = LLAMA3_PositionalEmbeddings.apply_rotary_emb(xq, xk, freqs_rope)
 
-        if cache_k is not None:
-            cache_k[:bs, start_pos : start_pos + seq_len] = xk
-            keys = cache_k[:bs, : start_pos + seq_len]
-        else:
-            keys = xk
-        if cache_v is not None:
-            cache_v[:bs, start_pos : start_pos + seq_len] = xv
-            values = cache_v[:bs, : start_pos + seq_len]
-        else:
-            values = xv
+        if kv_cache is not None:
+            keys, values = kv_cache.update(input_pos, xk, xv)
 
         if self.n_kv_heads < self.n_heads:
             keys = repeat_kv(keys, self.n_rep)
@@ -251,19 +243,17 @@ class WeightlessTransformerBlock(torch.nn.Module):
         self,
         x: torch.Tensor,
         weights: Dict[str, torch.Tensor],
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
-        start_pos: int,
+        cache_kv: torch.nn.Module,
+        input_pos: int,
         freqs_rope: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
         attended_x = self.layernorm(x, weights["input_layernorm.weight"])
         hidden = x + self.attention_module(
             attended_x,
-            start_pos,
+            input_pos,
             weights,
-            cache_k,
-            cache_v,
+            cache_kv,
             freqs_rope,
             mask,
         )
@@ -286,7 +276,7 @@ def move_to_device_recursive(data, device):
 
 
 class Transformer:
-    def __init__(self, model_dir, config, device="cpu"):
+    def __init__(self, model_dir, config, device="cpu", cache_max_seq_len=-1, cache_max_bs=1):
         model_dir = model_dir
         self.config = config
         self.device = device
@@ -310,7 +300,14 @@ class Transformer:
             ).to(self.device, dtype=torch.bfloat16)  # TODO: unhardcode this precision
         self.max_seq_len = self.config["max_position_embeddings"]
         self.num_layers = self.config["num_hidden_layers"]
-        self.caches_memory = build_kv_caches(self.config, device=self.device)
+        cache_max_seq_len = 4096
+        self.caches_memory = build_kv_caches(
+            self.config, 
+            device=self.device, 
+            max_seq_len=cache_max_seq_len if cache_max_seq_len > 0 else self.max_seq_len,
+            max_bs=cache_max_bs
+        )
+        print("Cache shape:", self.caches_memory[0].k_cache.shape)
 
         self.chunk_weights = load_block_chunk(
             model_dir, 0
@@ -329,7 +326,9 @@ class Transformer:
         self.layernorm = WeightlessRMSNorm()
 
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int):
+    def forward(self, tokens: torch.Tensor, input_pos: int):
+        # TODO: make input_pos a tensor of shape [B, 1], containing positions for each batch element
+        
         # emb O(0.0001)s
         # all blocks O(0.25)s
         # head 0(0.0001)s
@@ -340,23 +339,21 @@ class Transformer:
             scales=self.general_chunk_weights.get("model.embed_tokens.weight_scales"),
         )
         if self.config["model_type"] in ["phi3", "granite-small"]:
-            freqs_rope = self.freqs_rope[:, start_pos : start_pos + seq_len]
+            freqs_rope = self.freqs_rope[:, input_pos : input_pos + seq_len]
         else:
-            freqs_rope = self.freqs_rope[start_pos : start_pos + seq_len]
+            freqs_rope = self.freqs_rope[input_pos : input_pos + seq_len]
         mask = build_attention_mask(
-            seq_len, start_pos, device=tokens.device, dtype=seq_embeddings.dtype
+            seq_len, input_pos, device=tokens.device, dtype=seq_embeddings.dtype
         )
         h = seq_embeddings
         for layer_idx in range(self.num_layers):
-            cache_k = self.caches_memory[layer_idx]["k"]
-            cache_v = self.caches_memory[layer_idx]["v"]
+            cache_kv = self.caches_memory[layer_idx]
             block_weights = self.chunk_weights[layer_idx]
             h = self.transformer_block_fn(
                 h,
                 block_weights,
-                cache_k,
-                cache_v,
-                start_pos,
+                cache_kv,
+                input_pos,
                 freqs_rope,
                 mask,
             )

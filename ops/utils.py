@@ -132,54 +132,6 @@ def load_multiple_transformer_block_weights_and_remap(
     return loaded_weights
 
 
-def build_kv_caches(config, device, max_seq_len=2048, max_bs=4):
-    """
-    Builds N_layers KV caches of given size dictionary and places the caches on a given decide.
-
-    KV cache, memory occupation: MAX_BS*MAX_SEQ_LEN*N_KV_HEADS*HEAD_DIM*2 (2 because we have K and V)
-
-    MAX_BS = 1
-    MAX_SEQ_LEN = 2048 (can be up to 8192)
-    N_KV_HEADS = 8
-    HEAD_DIM = dim//n_heads=4096//32=128
-
-    Total per layer = 1 * 2048 * 8 * 128 * 2 = 4194304 entries
-    Bytes per layer = 4194304 * 4 (assuming float) = 16777216 bytes (16MB per layer)
-    Bytes per model = 16777216 * NUM_LAYERS = 16777216 * 32 = 536870912 (512MB per model)
-    """
-    if "torch." not in config["torch_dtype"]:
-        torch_dtype = "torch." + config["torch_dtype"]
-    else:
-        torch_dtype = config["torch_dtype"]
-    # We need this, as pytorch can't build a type instance from string
-    dtype_map = {
-        "torch.bfloat16": torch.bfloat16,
-        "torch.int8": torch.int8,
-        "torch.uint8": torch.uint8,
-        "torch.float16": torch.float16,
-        "torch.half": torch.float16,
-        "torch.float": torch.float32,
-        "torch.float32": torch.float32,
-    }
-
-    caches_memory = {}
-    n_kv_heads = config["num_key_value_heads"]
-    head_dim = config["hidden_size"] // config["num_attention_heads"]
-    for layer_idx in range(config["num_hidden_layers"]):
-        caches_memory[layer_idx] = {}
-        caches_memory[layer_idx]["k"] = torch.zeros(
-            (max_bs, max_seq_len, n_kv_heads, head_dim),
-            dtype=dtype_map[torch_dtype],
-            device=device,
-        )
-        caches_memory[layer_idx]["v"] = torch.zeros(
-            (max_bs, max_seq_len, n_kv_heads, head_dim),
-            dtype=dtype_map[torch_dtype],
-            device=device,
-        )
-    return caches_memory
-
-
 @torch.inference_mode()
 def build_attention_mask(seq_len, start_pos, device, dtype):
     """
