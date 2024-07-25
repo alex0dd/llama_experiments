@@ -1,8 +1,12 @@
 import argparse
 import time
 import torch
+
+from pathlib import Path
+
 from transformers import AutoTokenizer
-from utils.utils import load_json
+from utils.utils import load_json, save_json
+
 
 from ops.transformer_ops import Transformer
 from ops.generation import generate_text, generate_text_stream
@@ -75,6 +79,7 @@ terminators = [
     tokenizer.convert_tokens_to_ids("<|eot_id|>"),
 ]
 
+#TODO: make all status prints logging debug/info
 print("[STATUS] Model and tokenizer loaded successfully.")
 
 is_chat = interaction_type == "chat"
@@ -83,15 +88,36 @@ if is_chat:
 user_input_text = input("User: ").strip()
 while user_input_text != "/exit":
     if is_chat:
+        # TODO: package this conditional into functions
+        skip_generation = True
         if user_input_text == "/drop_history":
             chat_history = []
             print("[STATUS] Chat history dropped.")
-            user_input_text = input("User: ").strip()
-            continue
+        elif user_input_text.startswith("/save_history"):
+            # Expected format "/save_history path_to_history.json"
+            command_tokens = user_input_text.split()
+            assert len(command_tokens) == 2, "/save_history command needs only one path argument"
+            history_path = command_tokens[-1]
+            # Make dir if doesn't exist
+            Path(history_path).parent.mkdir(parents=True, exist_ok=True)
+            save_json(history_path, chat_history)
+            print(f"[STATUS] Chat history saved to {history_path}.")
+        elif user_input_text.startswith("/load_history"):
+            # Expected format "/load_history path_to_history.json"
+            command_tokens = user_input_text.split()
+            assert len(command_tokens) == 2, "/load_history command needs only one path argument"
+            history_path = command_tokens[-1]
+            chat_history = load_json(history_path)
+            print(f"[STATUS] Chat history loaded from {history_path}.")
         else:
             chat_history.append({"role": "user", "content": user_input_text})
             input_ids = tokenizer.apply_chat_template(chat_history, tokenize=True, add_generation_prompt=True)
             input_ids = [input_ids]
+            skip_generation = False
+
+        if skip_generation:
+            user_input_text = input("User: ").strip()
+            continue
     else:
         input_ids = text_to_ids(user_input_text, tokenizer)
     output_text = []

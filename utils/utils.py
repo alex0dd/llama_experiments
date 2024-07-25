@@ -81,8 +81,12 @@ def deallocate_tensor(tensor):
 
 def load_json(file_path):
     with open(file_path, "r") as file:
-        config = json.load(file)
-    return config
+        data = json.load(file)
+    return data
+
+def save_json(file_path, data):
+    with open(file_path, "w") as file:
+        json.dump(data, file, indent=4)
 
 
 def get_all_safetensors_model_files(model_dir):
