@@ -12,14 +12,19 @@ def quantize_fp32_linear_to_int8(linear_orig_weights):
 
 def linear_int8(inputs, weight_int8pack, scales, bias=None, original_shape=None):
     scales = scales.to(dtype=inputs.dtype)
-    if inputs.device.type == "mps" and len(inputs.shape) == 3:
-        # RuntimeError: _weight_int8pack_mm_mps : expect A to be 2D tensor.
-        outs = []
-        for i in range(inputs.shape[0]):
-            outs.append(torch._weight_int8pack_mm(inputs[i], weight_int8pack, scales))
-        out = torch.stack(outs)
-    else:
-        out = torch._weight_int8pack_mm(inputs, weight_int8pack, scales)
+    match inputs.device.type:
+        case "mps":
+            if len(inputs.shape) == 3:
+                # RuntimeError: _weight_int8pack_mm_mps : expect A to be 2D tensor.
+                outs = []
+                for i in range(inputs.shape[0]):
+                    outs.append(torch._weight_int8pack_mm(inputs[i], weight_int8pack, scales))
+                out = torch.stack(outs)
+            else:
+                out = torch._weight_int8pack_mm(inputs, weight_int8pack, scales)
+        case _:
+            # CUDA and CPU
+            out = torch.nn.functional.linear(inputs, weight_int8pack.to(dtype=inputs.dtype)) * scales
     if bias is not None:
         out += bias
     return out
