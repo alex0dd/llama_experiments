@@ -117,7 +117,7 @@ def generate_text(
     ]
     return decoded_tokens, total_tokens_count
 
-
+import time
 def generate_text_stream(
     model,
     tokenizer,
@@ -128,6 +128,7 @@ def generate_text_stream(
     top_p=0.9,
     stop_tokens_ids=None,
     stream_interval=4,
+    prev_pos=0
 ):
     """
     If temperature > 0, then top_p is used for sampling.
@@ -144,7 +145,6 @@ def generate_text_stream(
     except AttributeError:
         pad_id = pad_id
     batch_size = len(input_ids)
-    prev_pos = 0
 
     tokens = torch.full(
         (batch_size, total_len), pad_id, dtype=torch.long, device=device
@@ -167,18 +167,28 @@ def generate_text_stream(
     to_send_n_tokens = 0
 
     for cur_pos in range(min_prompt_len, total_len):
+        #prof.step()
+        start = time.time()
         logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+        end = time.time()
+        #torch.mps.synchronize()
+        #print(f"FW pass: {end-start}")
+        start = time.time()
         if temperature > 0:
             probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
             next_token = sample_top_p(probs, top_p)
         else:
             next_token = torch.argmax(logits[:, -1], dim=-1)
+        end = time.time()
+        #print(f"Sample: {end-start}")
         next_token = next_token.reshape(-1)
         # only replace token if prompt has already been generated
-        next_token = torch.where(
-            input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
-        )
+
+        start = time.time()
         tokens[:, cur_pos] = next_token
+        #torch.mps.synchronize()
+        end = time.time()
+        #print(f"Next token: {end-start}")
         """
         Needs to be on CPU:
         NotImplementedError: The operator 'aten::isin.Tensor_Tensor_out' is not currently implemented for the MPS device. If you want this op to be added in priority during the prototype phase of this feature, please comment on https://github.com/pytorch/pytorch/issues/77764. As a temporary fix, you can set the environment variable `PYTORCH_ENABLE_MPS_FALLBACK=1` to use the CPU as a fallback for this op. WARNING: this will be slower than running natively on MPS.
@@ -197,9 +207,9 @@ def generate_text_stream(
         to_send_n_tokens += 1
         out_resp = tokenizer.decode(out_tokens)
         if to_send_n_tokens == stream_interval:
-            yield out_resp[inp_len:], to_send_n_tokens
+            yield out_resp[inp_len:], to_send_n_tokens, cur_pos
             inp_len = 0
             to_send_n_tokens = 0
     # if we finished the generation, but some tokens are still not flushed
     if inp_len != 0:
-        yield out_resp[inp_len:], to_send_n_tokens
+        yield out_resp[inp_len:], to_send_n_tokens, cur_pos

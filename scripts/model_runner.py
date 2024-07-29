@@ -82,6 +82,8 @@ terminators = [
 #TODO: make all status prints logging debug/info
 print("[STATUS] Model and tokenizer loaded successfully.")
 
+
+cur_pos = 0
 is_chat = interaction_type == "chat"
 if is_chat:
     chat_history = []
@@ -108,6 +110,7 @@ while user_input_text != "/exit":
             assert len(command_tokens) == 2, "/load_history command needs only one path argument"
             history_path = command_tokens[-1]
             chat_history = load_json(history_path)
+            cur_pos = 0
             print(f"[STATUS] Chat history loaded from {history_path}.")
         else:
             chat_history.append({"role": "user", "content": user_input_text})
@@ -125,14 +128,18 @@ while user_input_text != "/exit":
     start_time = time.time()
     if is_chat:
         print("Assistant: ", end='', flush=True)
-    for word, n_tokens in generate_text_stream(model, tokenizer, input_ids, max_gen_len=max_gen_len, stop_tokens_ids=terminators):
+    for word, n_tokens, gen_cur_pos in generate_text_stream(model, tokenizer, input_ids, max_gen_len=max_gen_len, stop_tokens_ids=terminators, prev_pos=cur_pos):
         print(MAGENTA+f"{word}"+RESET, end='', flush=True)
         output_text.append(word)
         total_tokens_count += n_tokens
+        cur_pos = gen_cur_pos
     delta_time = time.time() - start_time
     output_text = "".join(output_text)
     if is_chat:
         chat_history.append({"role": "assistant", "content": output_text})
+    else:
+        # in completion mode we reset the current position only
+        cur_pos = 0
     print()
     print(f"[STATUS] Generation took {delta_time} seconds, {total_tokens_count/delta_time} tokens/s.")
     user_input_text = input("User: ").strip()

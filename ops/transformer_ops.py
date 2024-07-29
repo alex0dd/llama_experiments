@@ -276,7 +276,7 @@ def move_to_device_recursive(data, device):
 
 
 class Transformer:
-    def __init__(self, model_dir, config, device="cpu", cache_max_seq_len=-1, cache_max_bs=1):
+    def __init__(self, model_dir, config, device="cpu", cache_max_seq_len=4096, cache_max_bs=1):
         model_dir = model_dir
         self.config = config
         self.device = device
@@ -300,7 +300,6 @@ class Transformer:
             ).to(self.device, dtype=torch.bfloat16)  # TODO: unhardcode this precision
         self.max_seq_len = self.config["max_position_embeddings"]
         self.num_layers = self.config["num_hidden_layers"]
-        cache_max_seq_len = 4096
         self.caches_memory = build_kv_caches(
             self.config, 
             device=self.device, 
