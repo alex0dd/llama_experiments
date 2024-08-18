@@ -26,6 +26,15 @@ def hf_undo_permute(
         .reshape(dim1, dim2)
     )
 
+def hf_undo_permute_gemma2(
+    w: torch.Tensor, n_heads: int, dim1: int, dim2: int
+) -> torch.Tensor:
+    return (
+        w.view(n_heads, 2, dim1 // 2, dim2)
+        .transpose(1, 2)
+        .reshape(dim1 * n_heads, dim2)
+    )
+
 
 def remap_weights_if_needed(
     weights: torch.Tensor, param_name: str, config
@@ -36,12 +45,21 @@ def remap_weights_if_needed(
     This function will take a block of attention weights and permute only the ones that need to be permuted
     """
     if "self_attn.q_proj.weight" in param_name:
-        weights = hf_undo_permute(
-            weights,
-            n_heads=config["num_attention_heads"],
-            dim1=config["hidden_size"],
-            dim2=config["hidden_size"],
-        )
+        if "gemma2" in config["model_type"]:
+            # Gemma2 config has a different number of heads that's not inferrable form the other shapes
+            weights = hf_undo_permute_gemma2(
+                weights,
+                n_heads=config["num_attention_heads"],
+                dim1=config["hidden_size"] // (config["num_attention_heads"] + 1),
+                dim2=config["hidden_size"],
+            )
+        else:
+            weights = hf_undo_permute(
+                weights,
+                n_heads=config["num_attention_heads"],
+                dim1=config["hidden_size"],
+                dim2=config["hidden_size"],
+            )
     elif "self_attn.k_proj.weight" in param_name:
         # NOTE: for llama 3 70B this will need to be fixed further, as num_shards will be different
         num_shards = 1
@@ -50,12 +68,21 @@ def remap_weights_if_needed(
         n_heads_per_shard = n_heads // num_shards
         num_local_key_value_heads = n_heads_per_shard // num_key_value_heads
 
-        weights = hf_undo_permute(
-            weights,
-            n_heads=config["num_key_value_heads"],
-            dim1=config["hidden_size"] // num_local_key_value_heads,
-            dim2=config["hidden_size"],
-        )
+        if "gemma2" in config["model_type"]:
+            weights = hf_undo_permute_gemma2(
+                weights,
+                n_heads=config["num_key_value_heads"],
+                dim1=config["hidden_size"] // (config["num_attention_heads"] + 1),
+                dim2=config["hidden_size"],
+            )
+        else:
+            weights = hf_undo_permute(
+                weights,
+                n_heads=config["num_key_value_heads"],
+                dim1=config["hidden_size"] // num_local_key_value_heads,
+                dim2=config["hidden_size"],
+            )
+            #hf_undo_permute_gemma2(weights, n_heads=config["num_key_value_heads"], dim1=config["hidden_size"] // (config["num_attention_heads"] + 1),dim2=config["hidden_size"],)
     return weights
 
 
@@ -71,7 +98,10 @@ def get_all_layer_names_in_block(layer_idx: int, config) -> Dict[str, str]:
     else:
         attn_letters = ["q", "k", "v", "o"]
         mlp_names = ["down_proj", "gate_proj", "up_proj"]
-    norm_names = ["input_layernorm", "post_attention_layernorm"]
+    if "gemma2" in config["model_type"]:
+        norm_names = ["input_layernorm", "post_attention_layernorm", "post_feedforward_layernorm", "pre_feedforward_layernorm"]
+    else:
+        norm_names = ["input_layernorm", "post_attention_layernorm"]
     for letter in attn_letters:
         weight_remap[f"model.layers.{layer_idx}.self_attn.{letter}_proj.weight"] = (
             f"self_attn.{letter}_proj.weight"
@@ -133,12 +163,12 @@ def load_multiple_transformer_block_weights_and_remap(
 
 
 @torch.inference_mode()
-def build_attention_mask(seq_len, start_pos, device, dtype):
+def build_attention_mask(seq_len, start_pos, device, dtype, ignore_kv=False):
     """
     Builds a sequence mask tensor for attention modules.
     """
     mask = None
-    if seq_len > 1:
+    if seq_len >= 1:
         mask = torch.full((seq_len, seq_len), float("-inf"), device=device)
         mask = torch.triu(mask, diagonal=1)
         if device.type == "mps":
@@ -148,9 +178,10 @@ def build_attention_mask(seq_len, start_pos, device, dtype):
         # only for the new sequence. Thus, the matrix of scores is of size
         # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
         # j > cache_len + i, since row i corresponds to token cache_len + i.
-        mask = torch.hstack(
-            [torch.zeros((seq_len, start_pos), device=device), mask]
-        ).to(dtype)
+        if not ignore_kv:
+            mask = torch.hstack(
+                [torch.zeros((seq_len, start_pos), device=device), mask]
+            ).to(dtype)
     return mask
 
 
@@ -167,3 +198,9 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .expand(bs, slen, n_kv_heads, n_rep, head_dim)
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
     )
+
+def get_head_dim(config):
+    if "head_dim" in config:
+        return config["head_dim"]
+    else:
+        return config["hidden_size"] // config["num_attention_heads"]

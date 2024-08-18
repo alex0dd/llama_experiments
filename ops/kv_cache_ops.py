@@ -1,5 +1,7 @@
 import torch
 
+from ops.utils import get_head_dim
+
 def build_kv_caches(config, device, max_seq_len=2048, max_bs=4):
     """
     Builds N_layers KV caches of given size dictionary and places the caches on a given decide.
@@ -32,7 +34,7 @@ def build_kv_caches(config, device, max_seq_len=2048, max_bs=4):
 
     caches_memory = {}
     n_kv_heads = config["num_key_value_heads"]
-    head_dim = config["hidden_size"] // config["num_attention_heads"]
+    head_dim = get_head_dim(config)
     for layer_idx in range(config["num_hidden_layers"]):
         caches_memory[layer_idx] = KVCache(max_bs, max_seq_len, n_kv_heads, head_dim).to(device)
     return caches_memory

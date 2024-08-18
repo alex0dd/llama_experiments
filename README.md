@@ -53,6 +53,14 @@ python -m scripts.convert_safetensors_decoder_model_to_pkl --base_model_dir orig
 python -m scripts.convert_safetensors_decoder_model_to_pkl --base_model_dir original_models/granite-8b-code-instruct --output_model_dir converted_models/GRANITE-8B-CODE-INSTRUCT-PKL --quantization_type int8 --no-quantize_embeddings --disable-llama-qk-remap --custom_model_type granite-small
 ```
 
+### Gemma-2 2B
+
+```
+python -m scripts.convert_safetensors_decoder_model_to_pkl --base_model_dir original_models/gemma-2-2b-it --output_model_dir converted_models/GEMMA-2-2B-INSTRUCT-PKL --force-tie-word-embeddings
+
+python -m scripts.convert_safetensors_decoder_model_to_pkl --base_model_dir original_models/gemma-2-2b-it --output_model_dir converted_models/GEMMA-2-2B-INSTRUCT-PKL-disabled-remap --force-tie-word-embeddings --disable-llama-qk-remap
+```
+
 ## Running models
 
 ```
@@ -61,6 +69,21 @@ python -m scripts.model_runner --model-dir ${PWD}/converted_models/LLAMA-3-8B-IN
 python -m scripts.model_runner --model-dir ${PWD}/converted_models/LLAMA-3.1-8B-PKL-int8 --interaction-type completion
 
 python -m scripts.model_runner --model-dir ${PWD}/converted_models/LLAMA-3.1-8B-INSTRUCT-PKL-int8 --max-gen-len 4096
+
+python -m scripts.model_runner --model-dir ${PWD}/converted_models/GEMMA-2-2B-INSTRUCT-PKL  --max-gen-len 4096
+
+python -m scripts.model_runner --model-dir ${PWD}/converted_models/GEMMA-2-2B-INSTRUCT-PKL-disabled-remap  --max-gen-len 4096
+```
+
+python -m scripts.get_model_layers_and_shapes --base_model_dir original_models/gemma-2-2b-it 
+
+```
+python -m scripts.start_server --model-dir ${PWD}/converted_models/LLAMA-3.1-8B-INSTRUCT-PKL-int8 --max-gen-len 4096
+
+curl -X POST -H "Content-Type: application/json" -d '{"messages": [{"message": "What was my last question? Reply with 240 words?", "role": "user"}]}' http://127.0.0.1:6699/chat
+
+curl -X POST -H "Content-Type: application/json" -d '{"messages": [{"message": "What was my last question? Reply with 240 words?", "role": "user"}]}' http://127.0.0.1:6699/chat -w "\nTime Namelookup: %{time_namelookup}\nTime Connect: %{time_connect}\nTime Appconnect: %{time_appconnect}\nTime Pretransfer: %{time_pretransfer}\nTime Redirect: %{time_redirect}\nTime Starttransfer: %{time_starttransfer}\nTime Total: %{time_total}\n" -o /dev/null
+
 ```
 
 ## Supported and tested models

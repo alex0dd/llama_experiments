@@ -152,6 +152,11 @@ def parse_all_args():
         action="store_true",
         help="If specified, will disable the remapping of QK weights when loading them (for Granite3/8B models this needs to be disabled).",
     )
+    arg_parser.add_argument(
+        "--force-tie-word-embeddings",
+        action="store_true",
+        help="If specified, will force the usage of tie word embeddings in case this field is missing in config file (e.g., in Gemma-2 case).",
+    )
 
     # Parse the arguments
     args = arg_parser.parse_args()
@@ -165,6 +170,7 @@ quantization_type = args.quantization_type
 device = args.device
 quantize_embeddings = args.quantize_embeddings
 disable_llama_qk_remap = args.disable_llama_qk_remap
+force_tie_word_embeddings = args.force_tie_word_embeddings
 custom_model_type = args.custom_model_type
 max_seq_len = int(args.max_seq_len) if args.max_seq_len else None
 
@@ -178,7 +184,7 @@ config = load_json(config_file_path)
 if max_seq_len:
     assert max_seq_len <= config["max_position_embeddings"], "max-seq-len must be less than or equal to the original model's max_position_embeddings"
     config["max_position_embeddings"] = max_seq_len
-tie_word_embeddings = config["tie_word_embeddings"]
+tie_word_embeddings = config["tie_word_embeddings"] if "tie_word_embeddings" in config else force_tie_word_embeddings
 
 output_model_dir = output_model_dir + (
     "" if not quantization_type else f"-{quantization_type}"
