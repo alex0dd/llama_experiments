@@ -163,13 +163,13 @@ def load_multiple_transformer_block_weights_and_remap(
 
 
 @torch.inference_mode()
-def build_attention_mask(seq_len, start_pos, device, dtype, ignore_kv=False):
+def build_attention_mask(seq_len, start_pos, device, dtype, ignore_kv=False, fill_value=float("-inf")):
     """
     Builds a sequence mask tensor for attention modules.
     """
     mask = None
     if seq_len >= 1:
-        mask = torch.full((seq_len, seq_len), float("-inf"), device=device)
+        mask = torch.full((seq_len, seq_len), fill_value, device=device)
         mask = torch.triu(mask, diagonal=1)
         if device.type == "mps":
             # https://github.com/pytorch/pytorch/issues/100005
@@ -184,6 +184,27 @@ def build_attention_mask(seq_len, start_pos, device, dtype, ignore_kv=False):
             ).to(dtype)
     return mask
 
+@torch.inference_mode()
+def build_attention_mask_gemma2(seq_len, min_seq_len, start_pos, device, dtype, ignore_kv=False):
+    """
+    Builds a sequence mask tensor for attention modules.
+    """
+    mask = None
+    #breakpoint()
+    if seq_len >= 1:
+        # TODO: this is slow, bring this mask creation outside in the generator, if this function will work
+        mask = torch.full((seq_len, seq_len), torch.finfo(dtype).min, device=device)
+        mask = torch.triu(mask, diagonal=1)
+        if start_pos != 0:
+            if min_seq_len <= start_pos + 1:
+                mask = mask[min_seq_len:start_pos+1]#.unsqueeze(0)
+            else:
+                mask = mask[start_pos:min_seq_len]
+        else:
+            mask = mask[:min_seq_len]
+
+        #print(start_pos, min_seq_len, seq_len, mask.shape)
+    return mask
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """

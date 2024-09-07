@@ -10,6 +10,7 @@ from .kv_cache_ops import build_kv_caches, KVCache
 
 from .utils import (
     build_attention_mask,
+    build_attention_mask_gemma2,
     load_block_chunk,
     load_general_chunk,
     repeat_kv,
@@ -37,7 +38,7 @@ embeddings = {
     "int8": embedding_int8,
 }
 
-@torch.jit.script
+#@torch.jit.script
 def base_attn(q, k, v, mask, head_dim: int):
     normalize_fact = float(head_dim) ** -0.5
     scores = (q * normalize_fact) @ k.transpose(3, 2)
@@ -47,6 +48,7 @@ def base_attn(q, k, v, mask, head_dim: int):
         scores = scores / attn_logit_softcapping
         scores = torch.tanh(scores)
         scores = scores * attn_logit_softcapping
+    #print(scores.shape, mask.shape, q.shape, k.shape, v.shape)
     scores = scores + mask
     scores = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
     output = scores @ v
@@ -61,14 +63,15 @@ def base_attn_sliding(q, k, v, mask, head_dim: int, sliding_window_size: int):
     sliding_mask = torch.triu(
         all_ones, -1 * sliding_window_size + 1
     ) * torch.tril(all_ones, sliding_window_size - 1)
-    mask = torch.where(sliding_mask == 1, mask, -2.3819763e38)
+    mask = torch.where(sliding_mask == 1, mask, -3.3895e+38)
     attn_logit_softcapping = 50.0
     if attn_logit_softcapping is not None:
         scores = scores / attn_logit_softcapping
         scores = torch.tanh(scores)
         scores = scores * attn_logit_softcapping
-    #scores = scores + mask
-    scores = scores + mask.unsqueeze(0).unsqueeze(0)
+    #print(mask.shape, scores.shape, q.shape, k.shape, v.shape)
+    scores = scores + mask
+    #scores = scores + mask.unsqueeze(0).unsqueeze(0)
     scores = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
     output = scores @ v
     return output
@@ -325,21 +328,10 @@ class WeightlessGQA(torch.nn.Module):
         else:
             xq, xk = LLAMA3_PositionalEmbeddings.apply_rotary_emb(xq, xk, freqs_rope)
 
+        #breakpoint()
+
         if kv_cache is not None:
             keys, values = kv_cache.update(input_pos, xk, xv)
-        """
-        ### GEMMA2 only
-                # Write new kv cache.
-        # [batch_size, input_len, n_local_kv_heads, head_dim]
-        k_cache = kv_cache.k_cache
-        v_cache = kv_cache.v_cache
-        breakpoint()
-        k_cache.index_copy_(1, torch.tensor([[input_pos]]).to("mps"), xk)
-        v_cache.index_copy_(1, torch.tensor([[input_pos]]).to("mps"), xv)
-
-        keys = k_cache
-        values = v_cache
-        """
         
         if self.n_kv_heads < self.n_heads:
             keys = repeat_kv(keys, self.n_rep)
@@ -357,7 +349,6 @@ class WeightlessGQA(torch.nn.Module):
                         #output = base_attn(xq, keys, values, mask, self.head_dim)
                     case _:
                         output = base_attn(xq, keys, values, mask, self.head_dim)
-                    #print("attn_shape=", output.shape)
                 output = output[:, :, -seq_len:, :]
             else:
                 # Trick: since torch.jit won't trace if mask is none, 
@@ -446,6 +437,8 @@ class WeightlessTransformerBlock(torch.nn.Module):
                 hidden, weights["post_attention_layernorm.weight"]
             )
             hidden = residual + hidden
+            # NOTE: THIS WAS THE ERROR I WAS GETTING ALL THIS TIME, I DIDN'T PUT THIS LINE!
+            residual = hidden
             # MLP
             hidden = self.layernorm(
                 hidden, weights["pre_feedforward_layernorm.weight"]
@@ -547,7 +540,8 @@ class Transformer:
         self.output_hidden_states = output_hidden_states
 
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, input_pos: int):
+    def forward(self, tokens: torch.Tensor, input_pos: int, max_seq_len: int = None, min_seq_len: int = None):
+        # TODO: remove max_seq_len or change it, as it's needed for gemma2 correct masking
         if self.output_hidden_states: self.hidden_states = []
         # TODO: make input_pos a tensor of shape [B, 1], containing positions for each batch element
         
@@ -569,11 +563,11 @@ class Transformer:
         #)
         if not self.model_type in ["gemma2"]:
             mask = build_attention_mask(
-                seq_len, input_pos, device=tokens.device, dtype=seq_embeddings.dtype
+                seq_len, input_pos, device=tokens.device, dtype=seq_embeddings.dtype,
             )
         else:
-            mask = build_attention_mask(
-                seq_len, input_pos, device=tokens.device, dtype=seq_embeddings.dtype
+            mask = build_attention_mask_gemma2(
+                max_seq_len, min_seq_len, input_pos, device=tokens.device, dtype=seq_embeddings.dtype
             )
             #print(mask.shape)
             #mask = torch.nan_to_num(mask.cpu(), neginf=-2.3819763e38).to(self.device)

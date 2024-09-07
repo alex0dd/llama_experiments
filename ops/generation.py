@@ -169,7 +169,7 @@ def generate_text_stream(
     for cur_pos in range(min_prompt_len, total_len):
         #prof.step()
         start = time.time()
-        logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+        logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos, max_seq_len=total_len, min_seq_len=min_prompt_len)
         end = time.time()
         #torch.mps.synchronize()
         #print(f"FW pass: {end-start}")
