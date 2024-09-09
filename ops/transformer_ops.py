@@ -38,49 +38,23 @@ embeddings = {
     "int8": embedding_int8,
 }
 
-#@torch.jit.script
-def base_attn(q, k, v, mask, head_dim: int):
+@torch.jit.script
+def base_attn(q, k, v, mask, head_dim: int, attn_logit_softcapping: float = 0.0):
     normalize_fact = float(head_dim) ** -0.5
     scores = (q * normalize_fact) @ k.transpose(3, 2)
-
-    attn_logit_softcapping = 50.0
-    if attn_logit_softcapping is not None:
+    if attn_logit_softcapping > 0.0:
         scores = scores / attn_logit_softcapping
         scores = torch.tanh(scores)
         scores = scores * attn_logit_softcapping
-    #print(scores.shape, mask.shape, q.shape, k.shape, v.shape)
     scores = scores + mask
     scores = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
     output = scores @ v
     return output
 
-#@torch.jit.script
-def base_attn_sliding(q, k, v, mask, head_dim: int, sliding_window_size: int):
-    # Adapted from https://github.com/google/gemma_pytorch/blob/main/gemma/model.py
+def base_attn_unopt(q, k, v, mask, head_dim: int,  attn_logit_softcapping: float = 0.0):
     normalize_fact = float(head_dim) ** -0.5
     scores = (q * normalize_fact) @ k.transpose(3, 2)
-    all_ones = torch.ones_like(mask)
-    sliding_mask = torch.triu(
-        all_ones, -1 * sliding_window_size + 1
-    ) * torch.tril(all_ones, sliding_window_size - 1)
-    mask = torch.where(sliding_mask == 1, mask, -3.3895e+38)
-    attn_logit_softcapping = 50.0
-    if attn_logit_softcapping is not None:
-        scores = scores / attn_logit_softcapping
-        scores = torch.tanh(scores)
-        scores = scores * attn_logit_softcapping
-    #print(mask.shape, scores.shape, q.shape, k.shape, v.shape)
-    scores = scores + mask
-    #scores = scores + mask.unsqueeze(0).unsqueeze(0)
-    scores = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
-    output = scores @ v
-    return output
-
-def base_attn_unopt(q, k, v, mask, head_dim: int):
-    normalize_fact = float(head_dim) ** -0.5
-    scores = (q * normalize_fact) @ k.transpose(3, 2)
-    attn_logit_softcapping = 50.0
-    if attn_logit_softcapping is not None:
+    if attn_logit_softcapping > 0.0:
         scores = scores / attn_logit_softcapping
         scores = torch.tanh(scores)
         scores = scores * attn_logit_softcapping
@@ -188,72 +162,12 @@ class WeightlessRMSNorm(torch.nn.Module):
 
     @torch.inference_mode()
     def forward(self, inputs: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-        output = _normalization(inputs, eps=self.eps)
+        output = _normalization(inputs.float(), eps=self.eps)
         if self.add_unit_offset:
             output = output * (1 + weights.float())
             return output.type_as(inputs)
         else:
             return output * weights
-
-class Gemma2RotaryEmbedding(torch.nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
-        super().__init__()
-
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float() / self.dim))
-        self.register_buffer("inv_freq", tensor=inv_freq, persistent=False)
-
-    @torch.no_grad()
-    def forward(self, x, position_ids, seq_len=None):
-        # x: [bs, num_attention_heads, seq_len, head_size]
-        self.inv_freq.to(x.device)
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
-        position_ids_expanded = position_ids[:, None, :].float()
-        # Force float32 since bfloat16 loses precision on long contexts
-        # See https://github.com/huggingface/transformers/pull/29285
-        device_type = x.device.type
-        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False):
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos()
-            sin = emb.sin()
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`, *optional*):
-            Deprecated and unused.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
 
 
 class WeightlessGQA(torch.nn.Module):
@@ -265,7 +179,8 @@ class WeightlessGQA(torch.nn.Module):
         n_kv_heads: int,
         n_heads: int,
         head_dim: int,
-        attn_type: str = "vanilla"
+        attn_type: str = "vanilla",
+        attn_logit_softcapping: float = None
     ):
         super(WeightlessGQA, self).__init__()
         assert attn_type in ["vanilla", "apple", "sliding"]
@@ -276,7 +191,7 @@ class WeightlessGQA(torch.nn.Module):
         self.n_heads = n_heads
         self.head_dim = head_dim
         self.attn_type = attn_type
-        if self.model_type in ["gemma2"]: self.gemma2_rotary = Gemma2RotaryEmbedding(self.head_dim, max_position_embeddings=8192, base=10000.0).to("mps")
+        self.attn_logit_softcapping = attn_logit_softcapping
 
     @torch.inference_mode()
     def forward(
@@ -316,19 +231,12 @@ class WeightlessGQA(torch.nn.Module):
         xk = xk.view(bs, seq_len, self.n_kv_heads, self.head_dim)
         xv = xv.view(bs, seq_len, self.n_kv_heads, self.head_dim)
 
-        if self.model_type in ["phi3", "granite-small"]:
+        if self.model_type in ["phi3", "granite-small", "gemma2"]:
             xq, xk = Phi3_PositionalEmbeddings.apply_rotary_emb(
                 xq, xk, cos=freqs_rope[0], sin=freqs_rope[1]
             )
-        elif self.model_type in ["gemma2"]:
-            cos, sin = self.gemma2_rotary(xv, torch.arange(seq_len, device=xv.device).unsqueeze(0))
-            xq, xk = apply_rotary_pos_emb(xq.transpose(1, 2), xk.transpose(1, 2), cos, sin)
-            xq = xq.transpose(1, 2)
-            xk = xk.transpose(1, 2)
         else:
             xq, xk = LLAMA3_PositionalEmbeddings.apply_rotary_emb(xq, xk, freqs_rope)
-
-        #breakpoint()
 
         if kv_cache is not None:
             keys, values = kv_cache.update(input_pos, xk, xv)
@@ -343,24 +251,28 @@ class WeightlessGQA(torch.nn.Module):
                 mask = mask[:, : keys.shape[-2]]
                 match self.attn_type:
                     case "apple":
-                        output = apple_attn_wrapper(xq, keys, values, mask, self.head_dim)
+                        output = apple_attn_wrapper(xq, keys, values, mask, self.head_dim, attn_logit_softcapping=self.attn_logit_softcapping)
                     case "sliding":
-                        output = base_attn_sliding(xq, keys, values, mask, self.head_dim, 4096)
-                        #output = base_attn(xq, keys, values, mask, self.head_dim)
+                        sliding_window_size = 4096
+                        min_dtype = torch.finfo(xq.dtype).min
+                        sliding_window_mask = torch.tril(
+                            torch.ones_like(mask, dtype=torch.bool), diagonal=-sliding_window_size
+                        )
+                        mask = torch.where(sliding_window_mask, min_dtype, mask)
+                        if mask.shape[-1] <= 1:  # when decoding
+                            mask = mask[:, -sliding_window_size :]
+                        output = base_attn(xq, keys, values, mask, self.head_dim, attn_logit_softcapping=self.attn_logit_softcapping)
                     case _:
                         output = base_attn(xq, keys, values, mask, self.head_dim)
-                output = output[:, :, -seq_len:, :]
             else:
                 # Trick: since torch.jit won't trace if mask is none, 
                 # we'll call the unoptimized version just for first iteration
-                output = base_attn_unopt(xq, keys, values, mask, self.head_dim)
+                output = base_attn_unopt(xq, keys, values, None, self.head_dim, attn_logit_softcapping=self.attn_logit_softcapping)
         else:
             output = torch.nn.functional.scaled_dot_product_attention(
                 xq, keys, values, attn_mask=mask, dropout_p=0.0
             )
-        #print("before", output.shape)
-        output = output.transpose(1, 2).contiguous().view(bs, seq_len, -1)
-        #print("after", output.shape)
+        output = output.transpose(1, 2).contiguous().view(bs, output.shape[2], -1)
         output = self.linear_fn(
             output,
             weights["self_attn.o_proj.weight"],
@@ -389,7 +301,8 @@ class WeightlessTransformerBlock(torch.nn.Module):
             n_kv_heads=self.n_kv_heads, 
             n_heads=self.n_heads, 
             head_dim=self.head_dim,
-            attn_type=self.attn_type
+            attn_type=self.attn_type,
+            attn_logit_softcapping=config.get("attn_logit_softcapping", None)
         )
         self.hidden_activation = self._get_act_fn(config=self.config)
         self.ffn_module = WeightlessFFN(linear_fn, activation_fn=self.hidden_activation) if self.model_type != "phi3" else WeightlessPhi3FFN(linear_fn)
@@ -539,6 +452,8 @@ class Transformer:
 
         self.output_hidden_states = output_hidden_states
 
+        self.final_logit_softcapping=config.get("final_logit_softcapping", None)
+
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, input_pos: int, max_seq_len: int = None, min_seq_len: int = None):
         # TODO: remove max_seq_len or change it, as it's needed for gemma2 correct masking
@@ -558,9 +473,6 @@ class Transformer:
             freqs_rope = self.freqs_rope[:, input_pos : input_pos + seq_len]
         else:
             freqs_rope = self.freqs_rope[input_pos : input_pos + seq_len]
-        #mask = build_attention_mask(
-        #    seq_len, input_pos, device=tokens.device, dtype=seq_embeddings.dtype
-        #)
         if not self.model_type in ["gemma2"]:
             mask = build_attention_mask(
                 seq_len, input_pos, device=tokens.device, dtype=seq_embeddings.dtype,
@@ -569,8 +481,6 @@ class Transformer:
             mask = build_attention_mask_gemma2(
                 max_seq_len, min_seq_len, input_pos, device=tokens.device, dtype=seq_embeddings.dtype
             )
-            #print(mask.shape)
-            #mask = torch.nan_to_num(mask.cpu(), neginf=-2.3819763e38).to(self.device)
         h = seq_embeddings
         if self.model_type in ["gemma2"]:
             normalizer = torch.tensor(self.config["hidden_size"]**0.5, dtype=torch.bfloat16)
@@ -597,11 +507,10 @@ class Transformer:
             original_shape=self.general_chunk_weights.get("lm_head.weight_orig_shape"),
         ).float()
 
-        final_logit_softcapping = 30.0
-        if final_logit_softcapping is not None:
-            logits = logits / final_logit_softcapping
+        if self.final_logit_softcapping is not None:
+            logits = logits / self.final_logit_softcapping
             logits = torch.tanh(logits)
-            logits = logits * final_logit_softcapping
+            logits = logits * self.final_logit_softcapping
         if self.output_hidden_states:
             return logits, self.hidden_states
         else:
