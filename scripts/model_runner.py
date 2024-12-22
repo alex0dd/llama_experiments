@@ -5,7 +5,7 @@ import torch
 from pathlib import Path
 
 from transformers import AutoTokenizer
-from utils.utils import load_json, save_json
+from utils.utils import load_json, save_json, get_all_eos_token_ids
 
 
 from ops.transformer_ops import Transformer
@@ -76,8 +76,10 @@ tokenizer.pad_token = tokenizer.eos_token
 
 terminators = [
     tokenizer.eos_token_id,
-    tokenizer.convert_tokens_to_ids("<|eot_id|>"),
+    #tokenizer.convert_tokens_to_ids("<|end|>"),
 ]
+
+terminators += get_all_eos_token_ids(model_dir)
 
 #TODO: make all status prints logging debug/info
 print("[STATUS] Model and tokenizer loaded successfully.")

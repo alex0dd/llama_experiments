@@ -297,5 +297,6 @@ with open(config_fpath, "w") as file:
     json.dump(data, file, indent=4)
 # Copy all tokenizer files
 tokenizer_files = get_all_keyword_files(base_model_dir, "token", mode="contains")
-for f in tokenizer_files:
+gen_config_file = get_all_keyword_files(base_model_dir, "generation_config.json")
+for f in tokenizer_files+gen_config_file:
     shutil.copy2(f, output_model_dir)

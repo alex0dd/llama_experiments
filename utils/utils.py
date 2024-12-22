@@ -89,6 +89,17 @@ def save_json(file_path, data):
         json.dump(data, file, indent=4)
 
 
+def get_all_eos_token_ids(file_path):
+    """
+    Opens the tokenizer's generation_config.json file and loads eos_token_id
+    """
+    try:
+        gen_config = load_json(os.path.join(file_path, "generation_config.json"))
+        eos_token_ids = gen_config["eos_token_id"]
+    except:
+        eos_token_ids = []
+    return eos_token_ids
+
 def get_all_safetensors_model_files(model_dir):
     all_safetensors = []
     files_in_dir = os.listdir(model_dir)
