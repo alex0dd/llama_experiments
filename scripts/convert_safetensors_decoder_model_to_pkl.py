@@ -256,7 +256,7 @@ if not tie_word_embeddings:
     output_embedding_weights = model_parser.get_tensor("lm_head.weight")
 else:
     # We'll still need to quantize the output embedding weights, even if tied.
-    output_embedding_weights = embedding_weights
+    output_embedding_weights = model_parser.get_tensor("model.embed_tokens.weight")
 
 if quantization_type:
     orig_shapes = output_embedding_weights.shape
@@ -275,6 +275,8 @@ if quantization_type:
     general_chunk_dict["lm_head.weight_orig_shape"] = orig_shapes
 else:
     general_chunk_dict["lm_head.weight"] = output_embedding_weights.to(device)
+
+general_chunk_dict["lm_head.weight"] = general_chunk_dict["lm_head.weight"].contiguous()
 
 with open(os.path.join(output_model_dir, "general_chunk.pkl"), "wb") as f:
     pickle.dump(general_chunk_dict, f)

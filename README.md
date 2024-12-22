@@ -1,3 +1,11 @@
+# LLAMA Experiments
+
+A personal project to explore inference for LLAMA-based models, implemented from scratch in PyTorch, with a focus on various quantization strategies.
+
+**Note:** This project was created for fun and made public for transparency. Please be aware that the README and overall project quality might not be fully polished.
+
+## Some initial commands
+
 ```
 conda create -n llama_exploration python=3.10
 ```
@@ -29,6 +37,16 @@ python -m scripts.convert_safetensors_decoder_model_to_pkl --quantization_type i
 python -m scripts.convert_safetensors_decoder_model_to_pkl --quantization_type int8 --base_model_dir original_models/Meta-Llama-3.1-8B --output_model_dir converted_models/LLAMA-3.1-8B-PKL
 
 python -m scripts.convert_safetensors_decoder_model_to_pkl --quantization_type int8 --base_model_dir original_models/Meta-Llama-3.1-8B-Instruct --output_model_dir converted_models/LLAMA-3.1-8B-INSTRUCT-PKL
+```
+
+### LLAMA 3.2 3B
+
+```
+python -m scripts.convert_safetensors_decoder_model_to_pkl --base_model_dir original_models/Llama-3.2-3B --output_model_dir converted_models/LLAMA-3.2-3B-PKL --force-tie-word-embeddings
+
+python -m scripts.convert_safetensors_decoder_model_to_pkl --base_model_dir original_models/Llama-3.2-3B-Instruct --output_model_dir converted_models/LLAMA-3.2-3B-PKL --force-tie-word-embeddings
+
+python -m scripts.convert_safetensors_decoder_model_to_pkl --quantization_type int8 --base_model_dir original_models/Llama-3.2-3B-Instruct --output_model_dir converted_models/LLAMA-3.2-3B-PKL --force-tie-word-embeddings
 ```
 
 ### Phi3
@@ -72,10 +90,16 @@ python -m scripts.model_runner --model-dir ${PWD}/converted_models/LLAMA-3.1-8B-
 
 python -m scripts.model_runner --model-dir ${PWD}/converted_models/GEMMA-2-2B-INSTRUCT-PKL  --max-gen-len 4096
 
+python -m scripts.model_runner --model-dir ${PWD}/converted_models/PHI3-MINI-4K-PKL-int8  --max-gen-len 4096
+
 python -m scripts.model_runner --model-dir ${PWD}/converted_models/GEMMA-2-2B-INSTRUCT-PKL-disabled-remap  --max-gen-len 4096
+
+python -m scripts.model_runner --model-dir ${PWD}/converted_models/LLAMA-3.2-3B-PKL  --max-gen-len 4096
 ```
 
+```
 python -m scripts.get_model_layers_and_shapes --base_model_dir original_models/gemma-2-2b-it 
+```
 
 ```
 python -m scripts.start_server --model-dir ${PWD}/converted_models/LLAMA-3.1-8B-INSTRUCT-PKL-int8 --max-gen-len 4096
