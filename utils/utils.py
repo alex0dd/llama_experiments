@@ -84,6 +84,7 @@ def load_json(file_path):
         data = json.load(file)
     return data
 
+
 def save_json(file_path, data):
     with open(file_path, "w") as file:
         json.dump(data, file, indent=4)
@@ -96,9 +97,10 @@ def get_all_eos_token_ids(file_path):
     try:
         gen_config = load_json(os.path.join(file_path, "generation_config.json"))
         eos_token_ids = gen_config["eos_token_id"]
-    except:
+    except FileNotFoundError:
         eos_token_ids = []
     return eos_token_ids
+
 
 def get_all_safetensors_model_files(model_dir):
     all_safetensors = []
