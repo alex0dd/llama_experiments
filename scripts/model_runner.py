@@ -115,18 +115,16 @@ class TextGenerationApp:
         
         output_text = []
         total_tokens_count = 0
-        start_time = time.time()
         
         if self.config.interaction_type == "chat":
             print("Assistant: ", end='', flush=True)
             
-        for word, n_tokens, gen_cur_pos in self.generator.generate_stream(input_ids, gen_config):
+        for word, n_tokens, gen_cur_pos, metrics in self.generator.generate_stream(input_ids, gen_config):
             print(MAGENTA + f"{word}" + RESET, end='', flush=True)
             output_text.append(word)
             total_tokens_count += n_tokens
             self.cur_pos = gen_cur_pos
             
-        delta_time = time.time() - start_time
         full_response = "".join(output_text)
         
         if self.config.interaction_type == "chat":
@@ -134,7 +132,7 @@ class TextGenerationApp:
         else:
             self.cur_pos = 0
             
-        print(f"\n[STATUS] Generation took {delta_time:.2f} seconds, {total_tokens_count/delta_time:.2f} tokens/s.")
+        print(f"\n[PERFORMANCE METRICS]\n{metrics}")
         return full_response
 
 def parse_args() -> AppConfig:
