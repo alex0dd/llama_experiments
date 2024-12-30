@@ -1,6 +1,6 @@
 safetensors
 numpy
-torch==2.5.0
+torch==2.5.1
 jupyterlab
 transformers
 sentencepiece
