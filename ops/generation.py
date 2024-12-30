@@ -29,6 +29,7 @@ class TextGenerator:
         self.tokenizer = tokenizer
         self.device = model.device
         self.max_seq_len = model.max_seq_len
+        self.device = self.model.device
         
     def _prepare_inputs(self, input_ids: List[List[int]], total_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -48,10 +49,11 @@ class TextGenerator:
         """
         Get stop tokens tensor.
         """
+        device = self.device
         if stop_tokens_ids is None:
-            stop_tokens_tensor = torch.tensor([13], device="cpu")  # Default stop token
+            stop_tokens_tensor = torch.tensor([13], device=device)  # Default stop token
         else:
-            stop_tokens_tensor = torch.tensor(stop_tokens_ids, device="cpu")
+            stop_tokens_tensor = torch.tensor(stop_tokens_ids, device=device)
         return stop_tokens_tensor
 
     @staticmethod
@@ -114,7 +116,7 @@ class TextGenerator:
             next_token = self._sample_next_token(logits, config)
             
             tokens[:, cur_pos] = next_token
-            is_in = torch.isin(next_token.cpu(), stop_tokens).to(self.device)
+            is_in = torch.isin(next_token, stop_tokens)
             eos_reached |= (~input_text_mask[:, cur_pos]) & is_in
             prev_pos = cur_pos
             
@@ -186,7 +188,7 @@ class TextGenerator:
             next_token = self._sample_next_token(logits, config)
             tokens[:, cur_pos] = next_token
             
-            is_in = torch.isin(next_token.cpu(), stop_tokens).to(self.device)
+            is_in = torch.isin(next_token, stop_tokens)
             eos_reached |= (~input_text_mask[:, cur_pos]) & is_in
             prev_pos = cur_pos
             
