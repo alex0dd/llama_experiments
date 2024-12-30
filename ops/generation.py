@@ -2,6 +2,8 @@ import torch
 from typing import List, Tuple, Optional, Iterator
 from dataclasses import dataclass
 
+from utils.benchmarking import measure_performance
+
 @dataclass
 class GenerationConfig:
     """Configuration class for text generation parameters."""
@@ -14,8 +16,7 @@ class GenerationConfig:
     echo: bool = False
 
 class TextGenerator:
-    """A class to handle text generation using a language model."""
-    
+
     def __init__(self, model, tokenizer):
         """
         Initialize the text generator.
@@ -30,7 +31,9 @@ class TextGenerator:
         self.max_seq_len = model.max_seq_len
         
     def _prepare_inputs(self, input_ids: List[List[int]], total_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Prepare input tensors for generation."""
+        """
+        Prepare input tensors for generation.
+        """
         pad_id = self.tokenizer.eos_id if hasattr(self.tokenizer, 'eos_id') else self.tokenizer.eos_token_id
         batch_size = len(input_ids)
         
@@ -42,10 +45,14 @@ class TextGenerator:
         return tokens, input_text_mask
 
     def _get_stop_tokens(self, stop_tokens_ids: Optional[List[int]]) -> torch.Tensor:
-        """Get stop tokens tensor."""
+        """
+        Get stop tokens tensor.
+        """
         if stop_tokens_ids is None:
-            return torch.tensor([13], device="cpu")  # Default stop token
-        return torch.tensor(stop_tokens_ids, device="cpu")
+            stop_tokens_tensor = torch.tensor([13], device="cpu")  # Default stop token
+        else:
+            stop_tokens_tensor = torch.tensor(stop_tokens_ids, device="cpu")
+        return stop_tokens_tensor
 
     @staticmethod
     def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
@@ -68,7 +75,9 @@ class TextGenerator:
         return torch.gather(probs_idx, -1, next_token)
 
     def _sample_next_token(self, logits: torch.Tensor, config: GenerationConfig) -> torch.Tensor:
-        """Sample the next token based on the logits and generation config."""
+        """
+        Sample the next token based on the logits and generation config.
+        """
         if config.temperature > 0:
             probs = torch.softmax(logits[:, -1] / config.temperature, dim=-1)
             next_token = self.sample_top_p(probs, config.top_p)
@@ -76,6 +85,7 @@ class TextGenerator:
             next_token = torch.argmax(logits[:, -1], dim=-1)
         return next_token.reshape(-1)
 
+    @measure_performance(name="generation")
     def generate(self, input_ids: List[List[int]], config: GenerationConfig) -> Tuple[List[str], int]:
         """
         Generate text given input token ids.
@@ -115,7 +125,9 @@ class TextGenerator:
 
     def _process_output(self, tokens: torch.Tensor, input_ids: List[List[int]], 
                        config: GenerationConfig) -> Tuple[List[str], int]:
-        """Process the generated tokens into final output text."""
+        """
+        Process the generated tokens into final output text.
+        """
         tokens_output = []
         total_tokens_count = 0
         
@@ -137,6 +149,7 @@ class TextGenerator:
             
         return [self.tokenizer.decode(tokens) for tokens in tokens_output], total_tokens_count
 
+    @measure_performance(name="generate_stream")
     def generate_stream(self, input_ids: List[List[int]], config: GenerationConfig) -> Iterator[Tuple[str, int, int]]:
         """
         Stream generated text token by token.

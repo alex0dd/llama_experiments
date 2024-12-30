@@ -2,14 +2,12 @@ import time
 import functools
 from typing import Dict, Any, Callable, Optional
 from dataclasses import dataclass
-from collections import defaultdict
 import torch
 import psutil
 import numpy as np
 
 @dataclass
 class PerformanceMetrics:
-    """Container for various performance metrics."""
     total_time: float
     tokens_per_second: float
     peak_memory_gb: float
@@ -36,7 +34,9 @@ class PerformanceMetrics:
         return "\n".join(metrics_str)
 
 class PerformanceMonitor:
-    """Performance monitoring context manager and decorator."""
+    """
+    Performance monitoring context manager and decorator.
+    """
     
     def __init__(self, name: str = "default"):
         self.name = name
@@ -59,7 +59,9 @@ class PerformanceMonitor:
             return False
             
     def record_token_generation(self, num_tokens: int):
-        """Record latency for generating tokens."""
+        """
+        Record latency for generating tokens.
+        """
         current_time = time.perf_counter()
         if self.start_time is not None:
             latency = (current_time - self.start_time) * 1000  # Convert to ms
@@ -76,7 +78,9 @@ class PerformanceMonitor:
             self.cuda_peak_memory = max(self.cuda_peak_memory, current_cuda_memory)
             
     def get_metrics(self) -> PerformanceMetrics:
-        """Calculate and return performance metrics."""
+        """
+        Calculate and return performance metrics.
+        """
         if not self.latencies:
             return PerformanceMetrics(
                 total_time=0,
@@ -108,7 +112,9 @@ class PerformanceMonitor:
         )
 
 def measure_performance(name: str = "default"):
-    """Decorator for measuring performance metrics of text generation."""
+    """
+    Decorator for measuring performance metrics of text generation.
+    """
     def decorator(func: Callable):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):

@@ -15,7 +15,6 @@ RESET = '\033[0m'
 
 @dataclass
 class AppConfig:
-    """Application configuration class."""
     device: str
     model_dir: str
     streaming: bool
@@ -26,10 +25,8 @@ class AppConfig:
     stream_interval: int = 4
 
 class TextGenerationApp:
-    """Main application class for text generation."""
     
     def __init__(self, config: AppConfig):
-        """Initialize the text generation application."""
         self.config = config
         self.model = self._initialize_model()
         self.tokenizer = self._initialize_tokenizer()
@@ -39,12 +36,10 @@ class TextGenerationApp:
         self.cur_pos = 0
         
     def _initialize_model(self) -> Transformer:
-        """Initialize the transformer model."""
         model_config = load_json(f"{self.config.model_dir}/config.json")
         return Transformer(self.config.model_dir, model_config, device=self.config.device)
     
     def _initialize_tokenizer(self) -> AutoTokenizer:
-        """Initialize the tokenizer."""
         tokenizer = AutoTokenizer.from_pretrained(
             self.config.model_dir, 
             clean_up_tokenization_spaces=False
@@ -53,13 +48,22 @@ class TextGenerationApp:
         return tokenizer
     
     def _get_terminators(self) -> List[int]:
-        """Get terminator token IDs."""
+        """
+        Get terminator token IDs from generation_config.json 
+        file and tokenizer's EOS token.
+        """
         terminators = [self.tokenizer.eos_token_id]
         terminators.extend(get_all_eos_token_ids(self.config.model_dir))
         return terminators
 
     def _handle_chat_command(self, command: str) -> bool:
-        """Handle chat commands and return whether to skip generation."""
+        """
+        Handle chat commands and return whether to skip generation.
+        Supported commands:
+        - /drop_history
+        - /save_history
+        - /load_history
+        """
         if command == "/drop_history":
             self.chat_history = []
             print("[STATUS] Chat history dropped.")
@@ -86,23 +90,36 @@ class TextGenerationApp:
         return False
 
     def _prepare_input_ids(self, user_input: str) -> List[List[int]]:
-        """Prepare input IDs based on interaction type."""
+        """
+        Prepare input IDs based on interaction type defined in
+        application config. Iteration type can be chat or
+        completion.
+        """
         if self.config.interaction_type == "chat":
-            self.chat_history.append({"role": "user", "content": user_input})
-            return [self.tokenizer.apply_chat_template(
-                self.chat_history, 
-                tokenize=True, 
-                add_generation_prompt=True
-            )]
-        return self.tokenizer(
-            [user_input] if isinstance(user_input, str) else user_input,
-        )["input_ids"]
+            input_ids = [
+                self.tokenizer.apply_chat_template(
+                    self.chat_history, 
+                    tokenize=True, 
+                    add_generation_prompt=True
+                )
+            ]
+        else:
+            input_ids = self.tokenizer(
+                [user_input] if isinstance(user_input, str) else user_input,
+            )["input_ids"]
+        return input_ids
 
     def generate_response(self, user_input: str) -> Optional[str]:
-        """Generate response for user input."""
-        if self.config.interaction_type == "chat":
-            if self._handle_chat_command(user_input):
+        """
+        Generate response for user input.
+        """
+        is_chat = self.config.interaction_type == "chat"
+        if is_chat:
+            should_skip_generation = self._handle_chat_command(user_input)
+            if should_skip_generation:
                 return None
+            else:
+                self.chat_history.append({"role": "user", "content": user_input})
         
         input_ids = self._prepare_input_ids(user_input)
         gen_config = GenerationConfig(
@@ -114,20 +131,18 @@ class TextGenerationApp:
         )
         
         output_text = []
-        total_tokens_count = 0
         
-        if self.config.interaction_type == "chat":
+        if is_chat:
             print("Assistant: ", end='', flush=True)
             
         for word, n_tokens, gen_cur_pos, metrics in self.generator.generate_stream(input_ids, gen_config):
             print(MAGENTA + f"{word}" + RESET, end='', flush=True)
             output_text.append(word)
-            total_tokens_count += n_tokens
             self.cur_pos = gen_cur_pos
             
         full_response = "".join(output_text)
         
-        if self.config.interaction_type == "chat":
+        if is_chat:
             self.chat_history.append({"role": "assistant", "content": full_response})
         else:
             self.cur_pos = 0
@@ -180,7 +195,6 @@ def parse_args() -> AppConfig:
     )
 
 def main():
-    """Main function to run the text generation application."""
     config = parse_args()
     app = TextGenerationApp(config)
     print("[STATUS] Model and tokenizer loaded successfully.")
