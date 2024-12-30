@@ -1,147 +1,196 @@
 import argparse
 import time
 import torch
-
 from pathlib import Path
-
+from typing import List, Dict, Optional
+from dataclasses import dataclass
 from transformers import AutoTokenizer
+
 from utils.utils import load_json, save_json, get_all_eos_token_ids
-
-
+from ops.generation import GenerationConfig, TextGenerator
 from ops.transformer_ops import Transformer
-from ops.generation import generate_text, generate_text_stream
 
 MAGENTA = '\033[35m'
-RESET = '\033[0m' # called to return to standard terminal text color
+RESET = '\033[0m'
 
-def parse_all_args():
-    # Create the argument parser
-    arg_parser = argparse.ArgumentParser(description="Model runner script arguments.")
-    arg_parser.add_argument(
+@dataclass
+class AppConfig:
+    """Application configuration class."""
+    device: str
+    model_dir: str
+    streaming: bool
+    interaction_type: str
+    max_gen_len: int
+    temperature: float = 0.6
+    top_p: float = 0.9
+    stream_interval: int = 4
+
+class TextGenerationApp:
+    """Main application class for text generation."""
+    
+    def __init__(self, config: AppConfig):
+        """Initialize the text generation application."""
+        self.config = config
+        self.model = self._initialize_model()
+        self.tokenizer = self._initialize_tokenizer()
+        self.generator = TextGenerator(self.model, self.tokenizer)
+        self.terminators = self._get_terminators()
+        self.chat_history: List[Dict[str, str]] = []
+        self.cur_pos = 0
+        
+    def _initialize_model(self) -> Transformer:
+        """Initialize the transformer model."""
+        model_config = load_json(f"{self.config.model_dir}/config.json")
+        return Transformer(self.config.model_dir, model_config, device=self.config.device)
+    
+    def _initialize_tokenizer(self) -> AutoTokenizer:
+        """Initialize the tokenizer."""
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.config.model_dir, 
+            clean_up_tokenization_spaces=False
+        )
+        tokenizer.pad_token = tokenizer.eos_token
+        return tokenizer
+    
+    def _get_terminators(self) -> List[int]:
+        """Get terminator token IDs."""
+        terminators = [self.tokenizer.eos_token_id]
+        terminators.extend(get_all_eos_token_ids(self.config.model_dir))
+        return terminators
+
+    def _handle_chat_command(self, command: str) -> bool:
+        """Handle chat commands and return whether to skip generation."""
+        if command == "/drop_history":
+            self.chat_history = []
+            print("[STATUS] Chat history dropped.")
+            return True
+            
+        if command.startswith("/save_history"):
+            tokens = command.split()
+            assert len(tokens) == 2, "/save_history command needs only one path argument"
+            history_path = tokens[-1]
+            Path(history_path).parent.mkdir(parents=True, exist_ok=True)
+            save_json(history_path, self.chat_history)
+            print(f"[STATUS] Chat history saved to {history_path}.")
+            return True
+            
+        if command.startswith("/load_history"):
+            tokens = command.split()
+            assert len(tokens) == 2, "/load_history command needs only one path argument"
+            history_path = tokens[-1]
+            self.chat_history = load_json(history_path)
+            self.cur_pos = 0
+            print(f"[STATUS] Chat history loaded from {history_path}.")
+            return True
+            
+        return False
+
+    def _prepare_input_ids(self, user_input: str) -> List[List[int]]:
+        """Prepare input IDs based on interaction type."""
+        if self.config.interaction_type == "chat":
+            self.chat_history.append({"role": "user", "content": user_input})
+            return [self.tokenizer.apply_chat_template(
+                self.chat_history, 
+                tokenize=True, 
+                add_generation_prompt=True
+            )]
+        return self.tokenizer(
+            [user_input] if isinstance(user_input, str) else user_input,
+        )["input_ids"]
+
+    def generate_response(self, user_input: str) -> Optional[str]:
+        """Generate response for user input."""
+        if self.config.interaction_type == "chat":
+            if self._handle_chat_command(user_input):
+                return None
+        
+        input_ids = self._prepare_input_ids(user_input)
+        gen_config = GenerationConfig(
+            temperature=self.config.temperature,
+            top_p=self.config.top_p,
+            max_gen_len=self.config.max_gen_len,
+            stream_interval=self.config.stream_interval,
+            stop_tokens_ids=self.terminators
+        )
+        
+        output_text = []
+        total_tokens_count = 0
+        start_time = time.time()
+        
+        if self.config.interaction_type == "chat":
+            print("Assistant: ", end='', flush=True)
+            
+        for word, n_tokens, gen_cur_pos in self.generator.generate_stream(input_ids, gen_config):
+            print(MAGENTA + f"{word}" + RESET, end='', flush=True)
+            output_text.append(word)
+            total_tokens_count += n_tokens
+            self.cur_pos = gen_cur_pos
+            
+        delta_time = time.time() - start_time
+        full_response = "".join(output_text)
+        
+        if self.config.interaction_type == "chat":
+            self.chat_history.append({"role": "assistant", "content": full_response})
+        else:
+            self.cur_pos = 0
+            
+        print(f"\n[STATUS] Generation took {delta_time:.2f} seconds, {total_tokens_count/delta_time:.2f} tokens/s.")
+        return full_response
+
+def parse_args() -> AppConfig:
+    """Parse command line arguments and return AppConfig."""
+    parser = argparse.ArgumentParser(description="Model runner script arguments.")
+    parser.add_argument(
         "--device",
         type=str,
         choices=["cpu", "cuda", "mps"],
         default="mps",
-        help="Specify the device: cpu, cuda or mps. Defaults to 'mps' if not specified.",
+        help="Specify the device: cpu, cuda or mps. Defaults to 'mps'."
     )
-    arg_parser.add_argument(
+    parser.add_argument(
         "--model-dir",
         type=str,
         required=True,
-        help="Specify the path of model directory containing the model to run, after the conversion.",
+        help="Path of model directory containing the model to run."
     )
-    arg_parser.add_argument(
+    parser.add_argument(
         "--disable-streaming",
         action="store_true",
-        help="If specified, will disable streaming mode for responses.",
+        help="Disable streaming mode for responses."
     )
-    arg_parser.add_argument(
+    parser.add_argument(
         "--interaction-type",
         type=str,
         choices=["chat", "completion"],
         default="chat",
-        help="Specify the type of interaction: chat or completion. Defaults to 'chat' if not specified.",
+        help="Type of interaction: chat or completion. Defaults to 'chat'."
     )
-    arg_parser.add_argument(
+    parser.add_argument(
         "--max-gen-len",
         type=int,
         default=256,
-        help="Specify the maximum length of generated text. Defaults to 256 if not specified.",
+        help="Maximum length of generated text. Defaults to 256."
+    )
+    
+    args = parser.parse_args()
+    return AppConfig(
+        device=args.device,
+        model_dir=args.model_dir,
+        streaming=not args.disable_streaming,
+        interaction_type=args.interaction_type,
+        max_gen_len=args.max_gen_len
     )
 
-    # Parse the arguments
-    args = arg_parser.parse_args()
-    return args
+def main():
+    """Main function to run the text generation application."""
+    config = parse_args()
+    app = TextGenerationApp(config)
+    print("[STATUS] Model and tokenizer loaded successfully.")
+    
+    user_input = input("User: ").strip()
+    while user_input != "/exit":
+        app.generate_response(user_input)
+        user_input = input("User: ").strip()
 
-args = parse_all_args()
-
-streaming=not args.disable_streaming
-device=args.device
-model_dir = args.model_dir
-interaction_type = args.interaction_type
-max_gen_len = args.max_gen_len
-config = load_json(f"{model_dir}/config.json")
-
-def text_to_ids(text, tokenizer):
-    if type(text) != list: text = [text]
-    input_ids = tokenizer(
-        text,
-    )["input_ids"]
-    return input_ids
-
-model = Transformer(model_dir, config, device=device)
-
-tokenizer = AutoTokenizer.from_pretrained(model_dir, clean_up_tokenization_spaces=False)
-tokenizer.pad_token = tokenizer.eos_token
-
-terminators = [
-    tokenizer.eos_token_id,
-    #tokenizer.convert_tokens_to_ids("<|end|>"),
-]
-
-terminators += get_all_eos_token_ids(model_dir)
-
-#TODO: make all status prints logging debug/info
-print("[STATUS] Model and tokenizer loaded successfully.")
-
-
-cur_pos = 0
-is_chat = interaction_type == "chat"
-if is_chat:
-    chat_history = []
-user_input_text = input("User: ").strip()
-while user_input_text != "/exit":
-    if is_chat:
-        # TODO: package this conditional into functions
-        skip_generation = True
-        if user_input_text == "/drop_history":
-            chat_history = []
-            print("[STATUS] Chat history dropped.")
-        elif user_input_text.startswith("/save_history"):
-            # Expected format "/save_history path_to_history.json"
-            command_tokens = user_input_text.split()
-            assert len(command_tokens) == 2, "/save_history command needs only one path argument"
-            history_path = command_tokens[-1]
-            # Make dir if doesn't exist
-            Path(history_path).parent.mkdir(parents=True, exist_ok=True)
-            save_json(history_path, chat_history)
-            print(f"[STATUS] Chat history saved to {history_path}.")
-        elif user_input_text.startswith("/load_history"):
-            # Expected format "/load_history path_to_history.json"
-            command_tokens = user_input_text.split()
-            assert len(command_tokens) == 2, "/load_history command needs only one path argument"
-            history_path = command_tokens[-1]
-            chat_history = load_json(history_path)
-            cur_pos = 0
-            print(f"[STATUS] Chat history loaded from {history_path}.")
-        else:
-            chat_history.append({"role": "user", "content": user_input_text})
-            input_ids = tokenizer.apply_chat_template(chat_history, tokenize=True, add_generation_prompt=True)
-            input_ids = [input_ids]
-            skip_generation = False
-
-        if skip_generation:
-            user_input_text = input("User: ").strip()
-            continue
-    else:
-        input_ids = text_to_ids(user_input_text, tokenizer)
-    output_text = []
-    total_tokens_count = 0
-    start_time = time.time()
-    if is_chat:
-        print("Assistant: ", end='', flush=True)
-    for word, n_tokens, gen_cur_pos in generate_text_stream(model, tokenizer, input_ids, max_gen_len=max_gen_len, stop_tokens_ids=terminators, prev_pos=cur_pos):
-        print(MAGENTA+f"{word}"+RESET, end='', flush=True)
-        output_text.append(word)
-        total_tokens_count += n_tokens
-        cur_pos = gen_cur_pos
-    delta_time = time.time() - start_time
-    output_text = "".join(output_text)
-    if is_chat:
-        chat_history.append({"role": "assistant", "content": output_text})
-    else:
-        # in completion mode we reset the current position only
-        cur_pos = 0
-    print()
-    print(f"[STATUS] Generation took {delta_time} seconds, {total_tokens_count/delta_time} tokens/s.")
-    user_input_text = input("User: ").strip()
+if __name__ == "__main__":
+    main()

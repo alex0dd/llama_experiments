@@ -1,215 +1,196 @@
 import torch
+from typing import List, Tuple, Optional, Iterator
+from dataclasses import dataclass
 
+@dataclass
+class GenerationConfig:
+    """Configuration class for text generation parameters."""
+    temperature: float = 0.6
+    top_p: float = 0.9
+    max_gen_len: int = 100
+    stream_interval: int = 4
+    stop_tokens_ids: Optional[List[int]] = None
+    pad_id: Optional[int] = None
+    echo: bool = False
 
-def sample_top_p(probs, p):
-    """
-    Taken from: https://github.com/meta-llama/llama3/blob/main/llama/generation.py
+class TextGenerator:
+    """A class to handle text generation using a language model."""
+    
+    def __init__(self, model, tokenizer):
+        """
+        Initialize the text generator.
+        
+        Args:
+            model: The language model to use for generation
+            tokenizer: The tokenizer for encoding/decoding text
+        """
+        self.model = model
+        self.tokenizer = tokenizer
+        self.device = model.device
+        self.max_seq_len = model.max_seq_len
+        
+    def _prepare_inputs(self, input_ids: List[List[int]], total_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Prepare input tensors for generation."""
+        pad_id = self.tokenizer.eos_id if hasattr(self.tokenizer, 'eos_id') else self.tokenizer.eos_token_id
+        batch_size = len(input_ids)
+        
+        tokens = torch.full((batch_size, total_len), pad_id, dtype=torch.long, device=self.device)
+        for k, t in enumerate(input_ids):
+            tokens[k, :len(t)] = torch.tensor(t, dtype=torch.long, device=self.device)
+            
+        input_text_mask = tokens != pad_id
+        return tokens, input_text_mask
 
-    Perform top-p (nucleus) sampling on a probability distribution.
+    def _get_stop_tokens(self, stop_tokens_ids: Optional[List[int]]) -> torch.Tensor:
+        """Get stop tokens tensor."""
+        if stop_tokens_ids is None:
+            return torch.tensor([13], device="cpu")  # Default stop token
+        return torch.tensor(stop_tokens_ids, device="cpu")
 
-    Args:
-        probs (torch.Tensor): Probability distribution tensor.
-        p (float): Probability threshold for top-p sampling.
+    @staticmethod
+    def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
+        """
+        Perform top-p (nucleus) sampling on a probability distribution.
+        
+        Args:
+            probs: Probability distribution tensor
+            p: Probability threshold for top-p sampling
+            
+        Returns:
+            Sampled token indices
+        """
+        probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+        probs_sum = torch.cumsum(probs_sort, dim=-1)
+        mask = probs_sum - probs_sort > p
+        probs_sort[mask] = 0.0
+        probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+        next_token = torch.multinomial(probs_sort, num_samples=1)
+        return torch.gather(probs_idx, -1, next_token)
 
-    Returns:
-        torch.Tensor: Sampled token indices.
-
-    Note:
-        Top-p sampling selects the smallest set of tokens whose cumulative probability mass
-        exceeds the threshold p. The distribution is renormalized based on the selected tokens.
-    """
-    probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    mask = probs_sum - probs_sort > p
-    probs_sort[mask] = 0.0
-    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
-    next_token = torch.multinomial(probs_sort, num_samples=1)
-    next_token = torch.gather(probs_idx, -1, next_token)
-    return next_token
-
-
-def generate_text(
-    model,
-    tokenizer,
-    input_ids,
-    max_gen_len,
-    pad_id=None,
-    temperature=0.6,
-    top_p=0.9,
-    stop_tokens_ids=None,
-    streaming=False,
-    echo=False,
-):
-    """
-    If temperature > 0, then top_p is used for sampling.
-    """
-    device = model.device
-    max_seq_len = model.max_seq_len
-    min_prompt_len = min(len(t) for t in input_ids)
-    max_prompt_len = max(len(t) for t in input_ids)
-    assert max_prompt_len <= max_seq_len
-    total_len = min(max_seq_len, max_gen_len + max_prompt_len)
-
-    try:
-        pad_id = tokenizer.eos_id
-    except AttributeError:
-        pad_id = pad_id
-    batch_size = len(input_ids)
-    prev_pos = 0
-
-    tokens = torch.full(
-        (batch_size, total_len), pad_id, dtype=torch.long, device=device
-    )
-    for k, t in enumerate(input_ids):
-        tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=device)
-
-    eos_reached = torch.tensor([False] * batch_size, device=device)
-    input_text_mask = tokens != pad_id
-
-    if stop_tokens_ids is None:
-        stop_tokens = torch.tensor([13], device="cpu")  # 13
-        # stop_tokens = torch.tensor(list(tokenizer.stop_tokens))
-    else:
-        stop_tokens = torch.tensor(stop_tokens_ids, device="cpu")
-
-    tokens_output = []
-
-    for cur_pos in range(min_prompt_len, total_len):
-        logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
-        if temperature > 0:
-            probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
-            next_token = sample_top_p(probs, top_p)
+    def _sample_next_token(self, logits: torch.Tensor, config: GenerationConfig) -> torch.Tensor:
+        """Sample the next token based on the logits and generation config."""
+        if config.temperature > 0:
+            probs = torch.softmax(logits[:, -1] / config.temperature, dim=-1)
+            next_token = self.sample_top_p(probs, config.top_p)
         else:
             next_token = torch.argmax(logits[:, -1], dim=-1)
-        next_token = next_token.reshape(-1)
-        # only replace token if prompt has already been generated
-        next_token = torch.where(
-            input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
-        )
-        tokens[:, cur_pos] = next_token
+        return next_token.reshape(-1)
+
+    def generate(self, input_ids: List[List[int]], config: GenerationConfig) -> Tuple[List[str], int]:
         """
-        Needs to be on CPU:
-        NotImplementedError: The operator 'aten::isin.Tensor_Tensor_out' is not currently implemented for the MPS device. If you want this op to be added in priority during the prototype phase of this feature, please comment on https://github.com/pytorch/pytorch/issues/77764. As a temporary fix, you can set the environment variable `PYTORCH_ENABLE_MPS_FALLBACK=1` to use the CPU as a fallback for this op. WARNING: this will be slower than running natively on MPS.
+        Generate text given input token ids.
+        
+        Args:
+            input_ids: List of input token sequences
+            config: Generation configuration
+            
+        Returns:
+            Tuple of (generated texts, total token count)
         """
-        is_in = torch.isin(next_token.cpu(), stop_tokens).to(device)
-        eos_reached |= (~input_text_mask[:, cur_pos]) & (is_in)
-        prev_pos = cur_pos
-        if all(eos_reached):
-            break
-    tokens_output = []
-    total_tokens_count = 0
-    for idx, generated_tokens in enumerate(tokens.tolist()):
-        current_prompt_len = len(input_ids[idx])
-        start_pos = 0 if echo else current_prompt_len
-        generated_tokens = generated_tokens[
-            start_pos : current_prompt_len + max_gen_len
-        ]
-        for stop_token in stop_tokens_ids:
-            try:
-                idx_of_stop_token = generated_tokens.index(stop_token)
-                generated_tokens = generated_tokens[:idx_of_stop_token]
-            except ValueError:
-                pass
-        total_tokens_count += len(generated_tokens)
-        tokens_output.append(generated_tokens)
-    decoded_tokens = [
-        tokenizer.decode(generated_tokens) for generated_tokens in tokens_output
-    ]
-    return decoded_tokens, total_tokens_count
+        max_prompt_len = max(len(t) for t in input_ids)
+        min_prompt_len = min(len(t) for t in input_ids)
+        total_len = min(self.max_seq_len, config.max_gen_len + max_prompt_len)
+        
+        assert max_prompt_len <= self.max_seq_len, "Prompt length exceeds model's maximum sequence length"
+        
+        tokens, input_text_mask = self._prepare_inputs(input_ids, total_len)
+        stop_tokens = self._get_stop_tokens(config.stop_tokens_ids)
+        
+        eos_reached = torch.tensor([False] * len(input_ids), device=self.device)
+        prev_pos = 0
+        
+        for cur_pos in range(min_prompt_len, total_len):
+            logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+            next_token = self._sample_next_token(logits, config)
+            
+            tokens[:, cur_pos] = next_token
+            is_in = torch.isin(next_token.cpu(), stop_tokens).to(self.device)
+            eos_reached |= (~input_text_mask[:, cur_pos]) & is_in
+            prev_pos = cur_pos
+            
+            if all(eos_reached):
+                break
+                
+        return self._process_output(tokens, input_ids, config)
 
-import time
-def generate_text_stream(
-    model,
-    tokenizer,
-    input_ids,
-    max_gen_len,
-    pad_id=None,
-    temperature=0.6,
-    top_p=0.9,
-    stop_tokens_ids=None,
-    stream_interval=4,
-    prev_pos=0
-):
-    """
-    If temperature > 0, then top_p is used for sampling.
-    """
-    device = model.device
-    max_seq_len = model.max_seq_len
-    min_prompt_len = min(len(t) for t in input_ids)
-    max_prompt_len = max(len(t) for t in input_ids)
-    assert max_prompt_len <= max_seq_len
-    total_len = min(max_seq_len, max_gen_len + max_prompt_len)
+    def _process_output(self, tokens: torch.Tensor, input_ids: List[List[int]], 
+                       config: GenerationConfig) -> Tuple[List[str], int]:
+        """Process the generated tokens into final output text."""
+        tokens_output = []
+        total_tokens_count = 0
+        
+        for idx, generated_tokens in enumerate(tokens.tolist()):
+            current_prompt_len = len(input_ids[idx])
+            start_pos = 0 if config.echo else current_prompt_len
+            generated_tokens = generated_tokens[start_pos:current_prompt_len + config.max_gen_len]
+            
+            if config.stop_tokens_ids:
+                for stop_token in config.stop_tokens_ids:
+                    try:
+                        idx_of_stop_token = generated_tokens.index(stop_token)
+                        generated_tokens = generated_tokens[:idx_of_stop_token]
+                    except ValueError:
+                        continue
+                        
+            total_tokens_count += len(generated_tokens)
+            tokens_output.append(generated_tokens)
+            
+        return [self.tokenizer.decode(tokens) for tokens in tokens_output], total_tokens_count
 
-    try:
-        pad_id = tokenizer.eos_token_id
-    except AttributeError:
-        pad_id = pad_id
-    batch_size = len(input_ids)
-
-    tokens = torch.full(
-        (batch_size, total_len), pad_id, dtype=torch.long, device=device
-    )
-    for k, t in enumerate(input_ids):
-        tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=device)
-
-    eos_reached = torch.tensor([False] * batch_size, device=device)
-    input_text_mask = tokens != pad_id
-
-    if stop_tokens_ids is None:
-        stop_tokens = torch.tensor([13], device="cpu")  # 13
-        # stop_tokens = torch.tensor(list(tokenizer.stop_tokens))
-    else:
-        stop_tokens = torch.tensor(stop_tokens_ids, device="cpu")
-
-    out_resp = ""
-    out_tokens = []
-    inp_len = 0
-    to_send_n_tokens = 0
-
-    for cur_pos in range(min_prompt_len, total_len):
-        #prof.step()
-        start = time.time()
-        logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos, max_seq_len=total_len, min_seq_len=min_prompt_len)
-        end = time.time()
-        #torch.mps.synchronize()
-        #print(f"FW pass: {end-start}")
-        start = time.time()
-        if temperature > 0:
-            probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
-            next_token = sample_top_p(probs, top_p)
-        else:
-            next_token = torch.argmax(logits[:, -1], dim=-1)
-        end = time.time()
-        #print(f"Sample: {end-start}")
-        next_token = next_token.reshape(-1)
-        # only replace token if prompt has already been generated
-
-        start = time.time()
-        tokens[:, cur_pos] = next_token
-        #torch.mps.synchronize()
-        end = time.time()
-        #print(f"Next token: {end-start}")
+    def generate_stream(self, input_ids: List[List[int]], config: GenerationConfig) -> Iterator[Tuple[str, int, int]]:
         """
-        Needs to be on CPU:
-        NotImplementedError: The operator 'aten::isin.Tensor_Tensor_out' is not currently implemented for the MPS device. If you want this op to be added in priority during the prototype phase of this feature, please comment on https://github.com/pytorch/pytorch/issues/77764. As a temporary fix, you can set the environment variable `PYTORCH_ENABLE_MPS_FALLBACK=1` to use the CPU as a fallback for this op. WARNING: this will be slower than running natively on MPS.
+        Stream generated text token by token.
+        
+        Args:
+            input_ids: List of input token sequences
+            config: Generation configuration
+            
+        Yields:
+            Tuples of (generated_text, token_count, current_position)
         """
-        is_in = torch.isin(next_token.cpu(), stop_tokens).to(device)
-        eos_reached |= (~input_text_mask[:, cur_pos]) & (is_in)
-        prev_pos = cur_pos
-        if all(eos_reached):
-            break
-
-        # Workaround for https://github.com/huggingface/transformers/issues/22710
-        if to_send_n_tokens == 0:
-            to_send_n_tokens = 0
-            inp_len = len(out_resp)
-        out_tokens.append(next_token.item())
-        to_send_n_tokens += 1
-        out_resp = tokenizer.decode(out_tokens)
-        if to_send_n_tokens == stream_interval:
-            yield out_resp[inp_len:], to_send_n_tokens, cur_pos
-            inp_len = 0
-            to_send_n_tokens = 0
-    # if we finished the generation, but some tokens are still not flushed
-    if inp_len != 0:
-        yield out_resp[inp_len:], to_send_n_tokens, cur_pos
+        max_prompt_len = max(len(t) for t in input_ids)
+        min_prompt_len = min(len(t) for t in input_ids)
+        total_len = min(self.max_seq_len, config.max_gen_len + max_prompt_len)
+        
+        tokens, input_text_mask = self._prepare_inputs(input_ids, total_len)
+        stop_tokens = self._get_stop_tokens(config.stop_tokens_ids)
+        
+        eos_reached = torch.tensor([False] * len(input_ids), device=self.device)
+        prev_pos = 0
+        
+        out_tokens = []
+        inp_len = 0
+        to_send_n_tokens = 0
+        
+        for cur_pos in range(min_prompt_len, total_len):
+            logits = self.model.forward(
+                tokens[:, prev_pos:cur_pos], 
+                prev_pos, 
+                max_seq_len=total_len, 
+                min_seq_len=min_prompt_len
+            )
+            
+            next_token = self._sample_next_token(logits, config)
+            tokens[:, cur_pos] = next_token
+            
+            is_in = torch.isin(next_token.cpu(), stop_tokens).to(self.device)
+            eos_reached |= (~input_text_mask[:, cur_pos]) & is_in
+            prev_pos = cur_pos
+            
+            if all(eos_reached):
+                break
+                
+            if to_send_n_tokens == 0:
+                to_send_n_tokens = 0
+                inp_len = len(out_tokens)
+                
+            out_tokens.append(next_token.item())
+            to_send_n_tokens += 1
+            
+            if to_send_n_tokens == config.stream_interval:
+                yield self.tokenizer.decode(out_tokens[inp_len:]), to_send_n_tokens, cur_pos
+                inp_len = len(out_tokens)
+                to_send_n_tokens = 0
+                
+        if to_send_n_tokens > 0:
+            yield self.tokenizer.decode(out_tokens[inp_len:]), to_send_n_tokens, cur_pos
