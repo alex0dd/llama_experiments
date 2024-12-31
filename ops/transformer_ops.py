@@ -94,6 +94,7 @@ def apple_attn_wrapper(q, k, v, mask, head_dim: int):
     mask = mask.unsqueeze(1)
     attn_result = split_einsum_v2(perm_q, perm_k, perm_v, mask, heads, head_dim) # [1, 128, 32, 13]
     attn_result = torch.transpose(attn_result, 1, 3)
+    attn_result = torch.transpose(attn_result, 1, 2)
     return attn_result
 
 class WeightlessFFN(torch.nn.Module):
@@ -251,7 +252,7 @@ class WeightlessGQA(torch.nn.Module):
                 mask = mask[:, : keys.shape[-2]]
                 match self.attn_type:
                     case "apple":
-                        output = apple_attn_wrapper(xq, keys, values, mask, self.head_dim, attn_logit_softcapping=self.attn_logit_softcapping)
+                        output = apple_attn_wrapper(xq, keys, values, mask, self.head_dim)
                     case "sliding":
                         sliding_window_size = 4096
                         min_dtype = torch.finfo(xq.dtype).min
@@ -272,7 +273,12 @@ class WeightlessGQA(torch.nn.Module):
             output = torch.nn.functional.scaled_dot_product_attention(
                 xq, keys, values, attn_mask=mask, dropout_p=0.0
             )
-        output = output.transpose(1, 2).contiguous().view(bs, output.shape[2], -1)
+        
+        if self.attn_type != "apple":
+            output = output.transpose(1, 2).contiguous().view(bs, output.shape[2], -1)
+        else:
+            # TODO: later fix this specific apple attn case with transposing
+            output = output.contiguous().view(bs, output.shape[2], -1)
         output = self.linear_fn(
             output,
             weights["self_attn.o_proj.weight"],

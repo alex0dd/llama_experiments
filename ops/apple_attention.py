@@ -31,19 +31,19 @@ def split_einsum(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.
     attn_weights = [
         torch.einsum("bchq,bkhc->bkhq", [qi, ki]) * (dim_head**-0.5)
         for qi, ki in zip(mh_q, mh_k)
-    ]  # (bs, max_seq_length, 1, max_seq_length) * heads
+    ]  # (bs, max_seq_length_keys, 1, max_seq_length_query) * heads
+    # After prefill, query will be 1 token short usually.
 
     if mask is not None:
-        #print("mask.shape=",mask.shape)
         for head_idx in range(heads):
-            #print(f"attn_weights[{head_idx}].shape=",attn_weights[head_idx].shape)
+            attn_weights[head_idx] = torch.transpose(attn_weights[head_idx], 1, 3) # transpose the shapes
             attn_weights[head_idx] = attn_weights[head_idx] + mask
 
     attn_weights = [
         aw.softmax(dim=1) for aw in attn_weights
-    ]  # (bs, max_seq_length, 1, max_seq_length) * heads
+    ]  # (bs, max_seq_length_query, 1, max_seq_length_keys) * heads
     attn = [
-        torch.einsum("bkhq,bchk->bchq", wi, vi) for wi, vi in zip(attn_weights, mh_v)
+        torch.einsum("bqhk,bchk->bchq", wi, vi) for wi, vi in zip(attn_weights, mh_v)
     ]  # (bs, dim_head, 1, max_seq_length) * heads
 
     attn = torch.cat(attn, dim=2)  # (bs, dim, heads, max_seq_length)
