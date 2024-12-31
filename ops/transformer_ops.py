@@ -206,6 +206,8 @@ class WeightlessGQA(torch.nn.Module):
     ):
         bs, seq_len, _ = x.shape
 
+        x = x.bfloat16()
+
         xq = self.linear_fn(
             x,
             weights["self_attn.q_proj.weight"],
