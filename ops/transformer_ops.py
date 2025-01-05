@@ -1,24 +1,26 @@
+import logging
 from typing import Dict, Optional
 
 import torch
+
+import os
+import pickle
 
 from quantization.utils_int4 import embedding_int4, linear_int4
 from quantization.utils_int8 import embedding_int8, linear_int8
 
 from .rope import LLAMA3_PositionalEmbeddings, Phi3_PositionalEmbeddings
-from .kv_cache_ops import build_kv_caches, KVCache
+from .kv_cache_ops import build_kv_caches
 
 from .utils import (
     build_attention_mask,
     build_attention_mask_gemma2,
-    load_block_chunk,
     load_general_chunk,
     repeat_kv,
     get_head_dim
 )
 
-# TODO: clean this file and refactor
-# TODO: make RMSNorm's weights int8 quantizable
+logger = logging.getLogger(__name__)
 
 
 def embedding_matrix(inputs, weights, scales=None, original_shape=None):
@@ -400,12 +402,12 @@ def move_to_device_recursive(data, device):
 
 class Transformer:
     def __init__(self, model_dir, config, device="cpu", cache_max_seq_len=4096, cache_max_bs=1, output_hidden_states=False):
-        model_dir = model_dir
+        self.model_dir = model_dir
         self.config = config
         self.device = device
         self.head_dim = get_head_dim(config)
         self.model_type = self.config["model_type"]
-        if self.model_type  in ["llama", "mistral"]:
+        if self.model_type in ["llama", "mistral"]:
             self.freqs_rope = LLAMA3_PositionalEmbeddings.precompute_rope_constants(
                 self.head_dim,
                 self.config["max_position_embeddings"] * 2,
@@ -431,16 +433,27 @@ class Transformer:
             max_seq_len=cache_max_seq_len if cache_max_seq_len > 0 else self.max_seq_len,
             max_bs=cache_max_bs
         )
-        print("Cache shape:", self.caches_memory[0].k_cache.shape)
+        logger.info(f"Cache shape: {self.caches_memory[0].k_cache.shape}")
 
-        self.chunk_weights = load_block_chunk(
-            model_dir, 0
-        )  # assume all weights are in single chunk
-        self.general_chunk_weights = load_general_chunk(model_dir)
-        move_to_device_recursive(self.chunk_weights, self.device)
+        #self.chunk_weights = load_block_chunk(
+        #    model_dir, 0
+        #)  # assume all weights are in single chunk
+        
+        self.general_chunk_weights = load_general_chunk(self.model_dir)
+        #move_to_device_recursive(self.chunk_weights, self.device)
         move_to_device_recursive(self.general_chunk_weights, self.device)
 
         self.conversion_config = self.config.get("conversion_config", {})
+
+        # Get all the chunking info from conversion config, falling back
+        # to single chunk if needed.
+        chunking_info = self.conversion_config.get("chunking_info", {})
+        self.num_chunks = chunking_info.get("num_chunks", 1)
+        self.chunk_size = chunking_info.get(
+            "chunk_size",
+            config["num_hidden_layers"]
+        )
+
         self.precision = self.conversion_config.get("precision", "default")
         self.linear_fn = linears[self.precision]
         self.embedding_fn = embeddings[self.precision]
@@ -462,6 +475,41 @@ class Transformer:
 
         self.final_logit_softcapping=config.get("final_logit_softcapping", None)
 
+        self.current_chunk_idx = None
+        self.current_chunk_weights = None
+
+    def _get_chunk_idx_for_layer(self, layer_idx: int) -> int:
+        """
+        Determine which chunk file contains a given layer index.
+        """
+        return layer_idx // self.chunk_size
+    
+    def load_swap_chunk(self, needed_chunk_idx: int):
+        """
+        Loads the specified chunk from disk if it's not already loaded.
+        Unloads the previously loaded chunk to save memory.
+        """
+        if needed_chunk_idx == self.current_chunk_idx:
+            # Already loaded
+            return
+
+        logger.info(f"Swapping chunk {self.current_chunk_idx} with {needed_chunk_idx}.")
+        # Unload the old chunk
+        self.current_chunk_weights = None
+        if self.device.startswith("cuda"):
+            torch.cuda.empty_cache()  # optional, to free GPU memory
+
+        # Load new chunk
+        chunk_file = os.path.join(self.model_dir, f"blocks_chunk_{needed_chunk_idx}.pkl")
+        with open(chunk_file, "rb") as f:
+            chunk_data = pickle.load(f)
+
+        # Move weights to device if needed
+        move_to_device_recursive(chunk_data, self.device)
+
+        self.current_chunk_idx = needed_chunk_idx
+        self.current_chunk_weights = chunk_data
+    
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, input_pos: int, max_seq_len: int = None, min_seq_len: int = None):
         # TODO: remove max_seq_len or change it, as it's needed for gemma2 correct masking
@@ -496,7 +544,12 @@ class Transformer:
         if self.output_hidden_states: self.hidden_states.append(h)
         for layer_idx in range(self.num_layers):
             cache_kv = self.caches_memory[layer_idx]
-            block_weights = self.chunk_weights[layer_idx]
+
+            needed_chunk_idx = self._get_chunk_idx_for_layer(layer_idx)
+            self.load_swap_chunk(needed_chunk_idx)
+            
+            block_weights = self.current_chunk_weights[layer_idx]
+
             h = self.transformer_block_fns[layer_idx](
                 h,
                 block_weights,

@@ -6,6 +6,7 @@ import shutil
 import time
 
 import torch
+import math
 
 from ops.utils import load_multiple_transformer_block_weights_and_remap
 from parsers import ModelParser
@@ -141,6 +142,14 @@ def parse_all_args():
         help="If specified, this maximum sequence length will be used for the conversion.",
     )
     arg_parser.add_argument(
+        "--num-chunks",
+        type=int,
+        default=1,
+        help="Number of layer chunks to split the model into. "
+             "Set to a value > 1 if you wish to store the transformer layers "
+             "in multiple .pkl files for on-demand loading."
+    )
+    arg_parser.add_argument(
         "--quantize_embeddings",
         type=bool,
         action=argparse.BooleanOptionalAction,
@@ -173,11 +182,12 @@ disable_llama_qk_remap = args.disable_llama_qk_remap
 force_tie_word_embeddings = args.force_tie_word_embeddings
 custom_model_type = args.custom_model_type
 max_seq_len = int(args.max_seq_len) if args.max_seq_len else None
+num_chunks = args.num_chunks
 
 base_model_dir = args.base_model_dir
 output_model_dir = args.output_model_dir
 
-config_file_path = f"./{base_model_dir}/config.json"
+config_file_path = f"{base_model_dir}/config.json"
 model_files = get_all_keyword_files(base_model_dir, "safetensors", mode="endswith")
 model_parser = ModelParser(model_files)
 config = load_json(config_file_path)
@@ -189,50 +199,55 @@ tie_word_embeddings = config["tie_word_embeddings"] if "tie_word_embeddings" in 
 output_model_dir = output_model_dir + (
     "" if not quantization_type else f"-{quantization_type}"
 )
+output_model_dir = output_model_dir + (
+    f"-chunks_{num_chunks}" if num_chunks > 1 else ""
+)
 
 if not os.path.exists(output_model_dir):
     os.makedirs(output_model_dir)
 
 num_layers = int(config["num_hidden_layers"])
-preload_n_transformer_blocks = (
-    num_layers  # preload all (since we're dealing with not so big models)
-)
+chunk_size = math.ceil(num_layers / num_chunks)
 
-current_transformer_blocks_loaded = None
-layer_idxs_to_load = []
-current_chunk = -1
-for layer_idx in range(num_layers):
-    if len(layer_idxs_to_load) == 0:
-        current_chunk += 1
-        current_transformer_blocks_loaded = None
-        layer_idxs_to_load = [
-            layer_idx + i for i in range(preload_n_transformer_blocks)
-        ]
-    if current_transformer_blocks_loaded is None:
-        print(f"Beginning to load layers: {layer_idxs_to_load}")
-        start_t = time.time()
-        current_transformer_blocks_loaded = (
-            load_multiple_transformer_block_weights_and_remap(
-                model_parser,
-                config,
-                layer_idxs_to_load,
-                device=device,
-                disable_llama_qk_remap=disable_llama_qk_remap,
-            )
+layer_start = 0
+layer_ranges = []
+for chunk_idx in range(num_chunks):
+    layer_end = min(layer_start + chunk_size, num_layers)
+    layer_idxs_to_load = list(range(layer_start, layer_end))
+    if not layer_idxs_to_load:
+        break  # in case chunk_size * num_chunks > num_layers
+
+    print(f"Beginning to load layers: {layer_idxs_to_load}")
+    start_t = time.time()
+
+    # Load weights for the specified layer range
+    current_transformer_blocks_loaded = load_multiple_transformer_block_weights_and_remap(
+        model_parser,
+        config,
+        layer_idxs_to_load,
+        device=device,
+        disable_llama_qk_remap=disable_llama_qk_remap,
+    )
+
+    # Quantize
+    if quantization_type:
+        quantize_all_mlps(
+            current_transformer_blocks_loaded,
+            quant_type=quantization_type,
+            device=device,
         )
-        if quantization_type:
-            quantize_all_mlps(
-                current_transformer_blocks_loaded,
-                quant_type=quantization_type,
-                device=device,
-            )
-        delta_t = time.time() - start_t
-        print(f"Finished to load layers: {layer_idxs_to_load} in {delta_t} seconds.")
-        with open(
-            os.path.join(output_model_dir, f"blocks_chunk_{current_chunk}.pkl"), "wb"
-        ) as f:
-            pickle.dump(current_transformer_blocks_loaded, f)
-    layer_idxs_to_load.pop(0)  # remove index as "consumed"
+
+    delta_t = time.time() - start_t
+    print(f"Finished chunk {chunk_idx} (layers {layer_start}-{layer_end-1}) in {delta_t:.2f} seconds.")
+
+    # Dump to file
+    chunk_path = os.path.join(output_model_dir, f"blocks_chunk_{chunk_idx}.pkl")
+    with open(chunk_path, "wb") as f:
+        pickle.dump(current_transformer_blocks_loaded, f)
+
+    # Advance to next chunk
+    layer_ranges.append([layer_start, layer_end - 1])
+    layer_start = layer_end
 
 output_norm_weights = model_parser.get_tensor("model.norm.weight")
 general_chunk_dict = {
@@ -289,7 +304,12 @@ with open(config_fpath, "r") as file:
     data = json.load(file)
 
 data["conversion_config"] = {
-    "precision": "default" if not quantization_type else quantization_type
+    "precision": "default" if not quantization_type else quantization_type,
+    "chunking_info": {
+        "num_chunks": num_chunks,
+        "chunk_size": chunk_size,
+        "layer_ranges": layer_ranges  # e.g. [[0,13],[14,27]]
+    }
 }
 
 if custom_model_type:
