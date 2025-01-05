@@ -68,13 +68,17 @@ class TextGenerator:
         Returns:
             Sampled token indices
         """
-        probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
-        probs_sum = torch.cumsum(probs_sort, dim=-1)
-        mask = probs_sum - probs_sort > p
-        probs_sort[mask] = 0.0
-        probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
-        next_token = torch.multinomial(probs_sort, num_samples=1)
-        return torch.gather(probs_idx, -1, next_token)
+        if p >= 1.0:
+            # In this case, we take all tokens, so no sorting and masking is needed
+            return torch.multinomial(probs, num_samples=1)
+        else:
+            probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+            probs_sum = torch.cumsum(probs_sort, dim=-1)
+            mask = probs_sum - probs_sort > p
+            probs_sort[mask] = 0.0
+            probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+            next_token = torch.multinomial(probs_sort, num_samples=1)
+            return torch.gather(probs_idx, -1, next_token)
 
     def _sample_next_token(self, logits: torch.Tensor, config: GenerationConfig) -> torch.Tensor:
         """
