@@ -9,10 +9,11 @@ import pickle
 from quantization.utils_int4 import embedding_int4, linear_int4
 from quantization.utils_int8 import embedding_int8, linear_int8
 
-from .rope import LLAMA3_PositionalEmbeddings, Phi3_PositionalEmbeddings
-from .kv_cache_ops import build_kv_caches
+from ops.rope import LLAMA3_PositionalEmbeddings, Phi3_PositionalEmbeddings
+from ops.kv_cache_ops import build_kv_caches
+from ops.attention_ops import apple_attn_wrapper, base_attn, base_attn_unopt
 
-from .utils import (
+from ops.utils import (
     build_attention_mask,
     build_attention_mask_gemma2,
     load_general_chunk,
@@ -39,65 +40,6 @@ embeddings = {
     "int4": embedding_int4,
     "int8": embedding_int8,
 }
-
-@torch.jit.script
-def base_attn(q, k, v, mask, head_dim: int, attn_logit_softcapping: float = 0.0):
-    normalize_fact = float(head_dim) ** -0.5
-    scores = (q * normalize_fact) @ k.transpose(3, 2)
-    if attn_logit_softcapping > 0.0:
-        scores = scores / attn_logit_softcapping
-        scores = torch.tanh(scores)
-        scores = scores * attn_logit_softcapping
-    scores = scores + mask
-    scores = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
-    output = scores @ v
-    return output
-
-def base_attn_unopt(q, k, v, mask, head_dim: int,  attn_logit_softcapping: float = 0.0):
-    normalize_fact = float(head_dim) ** -0.5
-    scores = (q * normalize_fact) @ k.transpose(3, 2)
-    if attn_logit_softcapping > 0.0:
-        scores = scores / attn_logit_softcapping
-        scores = torch.tanh(scores)
-        scores = scores * attn_logit_softcapping
-    if mask is not None:
-        scores = scores + mask
-    scores = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
-    output = scores @ v
-    return output
-
-from ops.apple_attention import split_einsum_v2, split_einsum
-@torch.jit.script
-def apple_attn_wrapper(q, k, v, mask, head_dim: int):
-    # Q needs to become (bs, dim_head, heads, seq_len)
-    # K needs to become (bs, dim_head, heads, seq_len) 
-    #   but internally needs to be transposed to (bs, seq_len, heads, dim_head).
-    #   So we change the internals and transpose it here directly to that format.
-    # V needs to become (bs, dim_head, heads, seq_len)
-    # Mask needs to become (bs, seq_len, n_heads, seq_len)
-
-    # Q= torch.Size([1, 32, 13, 128]) -> [bs, heads, seq_len, dim_head]
-    # K= torch.Size([1, 32, 13, 128]) -> [bs, heads, seq_len, dim_head]
-    # V= torch.Size([1, 32, 13, 128]) -> [bs, heads, seq_len, dim_head]
-    # Mask= torch.Size([13, 13]) -> [seq_len, seq_len]
-    # output= torch.Size([1, 12, 32, 128])
-
-    #import torch
-    #from ops.apple_attention import split_einsum
-    #q = torch.randn(1, 32, 13, 128)
-    #k = torch.randn(1, 32, 13, 128)
-    #v = torch.randn(1, 32, 13, 128)
-    #mask = torch.randn(13, 13)
-    #head_dim = 128
-    heads = q.shape[1]
-    perm_q = torch.permute(q, (0, 3, 1, 2))
-    perm_k = torch.permute(k, (0, 2, 1, 3))
-    perm_v = torch.permute(v, (0, 3, 1, 2))
-    mask = mask.unsqueeze(1)
-    attn_result = split_einsum_v2(perm_q, perm_k, perm_v, mask, heads, head_dim) # [1, 128, 32, 13]
-    attn_result = torch.transpose(attn_result, 1, 3)
-    attn_result = torch.transpose(attn_result, 1, 2)
-    return attn_result
 
 class WeightlessFFN(torch.nn.Module):
     def __init__(self, linear_fn, activation_fn=torch.nn.functional.silu):
@@ -195,6 +137,7 @@ class WeightlessGQA(torch.nn.Module):
         self.head_dim = head_dim
         self.attn_type = attn_type
         self.attn_logit_softcapping = attn_logit_softcapping
+        self.normalization_factor = float(self.head_dim) ** -0.5
 
     @torch.inference_mode()
     def forward(
@@ -236,7 +179,7 @@ class WeightlessGQA(torch.nn.Module):
         xk = xk.view(bs, seq_len, self.n_kv_heads, self.head_dim)
         xv = xv.view(bs, seq_len, self.n_kv_heads, self.head_dim)
 
-        if self.model_type in ["phi3", "granite-small", "gemma2"]:
+        if self.model_type in ["phi3", "granite-small", "gemma2", "qwen2"]:
             xq, xk = Phi3_PositionalEmbeddings.apply_rotary_emb(
                 xq, xk, cos=freqs_rope[0], sin=freqs_rope[1]
             )
@@ -256,7 +199,7 @@ class WeightlessGQA(torch.nn.Module):
                 mask = mask[:, : keys.shape[-2]]
                 match self.attn_type:
                     case "apple":
-                        output = apple_attn_wrapper(xq, keys, values, mask, self.head_dim)
+                        output = apple_attn_wrapper(xq, keys, values, mask, self.normalization_factor)
                     case "sliding":
                         sliding_window_size = 4096
                         min_dtype = torch.finfo(xq.dtype).min
@@ -266,13 +209,13 @@ class WeightlessGQA(torch.nn.Module):
                         mask = torch.where(sliding_window_mask, min_dtype, mask)
                         if mask.shape[-1] <= 1:  # when decoding
                             mask = mask[:, -sliding_window_size :]
-                        output = base_attn(xq, keys, values, mask, self.head_dim, attn_logit_softcapping=self.attn_logit_softcapping)
+                        output = base_attn(xq, keys, values, mask, self.normalization_factor, attn_logit_softcapping=self.attn_logit_softcapping)
                     case _:
-                        output = base_attn(xq, keys, values, mask, self.head_dim)
+                        output = base_attn(xq, keys, values, mask, self.normalization_factor)
             else:
                 # Trick: since torch.jit won't trace if mask is none, 
                 # we'll call the unoptimized version just for first iteration
-                output = base_attn_unopt(xq, keys, values, None, self.head_dim, attn_logit_softcapping=self.attn_logit_softcapping)
+                output = base_attn_unopt(xq, keys, values, None, self.normalization_factor, attn_logit_softcapping=self.attn_logit_softcapping)
         else:
             output = torch.nn.functional.scaled_dot_product_attention(
                 xq, keys, values, attn_mask=mask, dropout_p=0.0
@@ -413,7 +356,7 @@ class Transformer:
                 self.config["max_position_embeddings"] * 2,
                 self.config["rope_theta"],
             ).to(self.device)
-        elif self.model_type in ["phi3", "granite-small", "gemma2"]:
+        elif self.model_type in ["phi3", "granite-small", "gemma2", "qwen2"]:
             position_ids = torch.arange(
                 0, self.config["max_position_embeddings"], dtype=torch.long
             )
@@ -525,7 +468,7 @@ class Transformer:
             self.general_chunk_weights["model.embed_tokens.weight"],
             scales=self.general_chunk_weights.get("model.embed_tokens.weight_scales"),
         )
-        if self.model_type in ["phi3", "granite-small", "gemma2"]:
+        if self.model_type in ["phi3", "granite-small", "gemma2", "qwen2"]:
             freqs_rope = self.freqs_rope[:, input_pos : input_pos + seq_len]
         else:
             freqs_rope = self.freqs_rope[input_pos : input_pos + seq_len]
