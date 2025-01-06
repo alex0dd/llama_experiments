@@ -46,7 +46,9 @@ python -m scripts.convert_safetensors_decoder_model_to_pkl --base_model_dir orig
 
 python -m scripts.convert_safetensors_decoder_model_to_pkl --base_model_dir original_models/Llama-3.2-3B-Instruct --output_model_dir converted_models/LLAMA-3.2-3B-PKL --force-tie-word-embeddings
 
-python -m scripts.convert_safetensors_decoder_model_to_pkl --quantization_type int8 --base_model_dir original_models/Llama-3.2-3B-Instruct --output_model_dir converted_models/LLAMA-3.2-3B-PKL --force-tie-word-embeddings
+python -m scripts.convert_safetensors_decoder_model_to_pkl --quantization_type int8 --base_model_dir original_models/Llama-3.2-3B-Instruct --output_model_dir converted_models/LLAMA-3.2-3B-PKL --force-tie-word-embeddings --quantize-embeddings
+
+python -m scripts.convert_safetensors_decoder_model_to_pkl --quantization_type int8 --base_model_dir original_models/Llama-3.2-3B-Instruct --output_model_dir converted_models/LLAMA-3.2-3B-PKL --force-tie-word-embeddings --num-chunks 2 --quantize-embeddings
 ```
 
 ### Phi3
@@ -77,6 +79,12 @@ python -m scripts.convert_safetensors_decoder_model_to_pkl --base_model_dir orig
 python -m scripts.convert_safetensors_decoder_model_to_pkl --base_model_dir original_models/gemma-2-2b-it --output_model_dir converted_models/GEMMA-2-2B-INSTRUCT-PKL --force-tie-word-embeddings
 
 python -m scripts.convert_safetensors_decoder_model_to_pkl --base_model_dir original_models/gemma-2-2b-it --output_model_dir converted_models/GEMMA-2-2B-INSTRUCT-PKL-disabled-remap --force-tie-word-embeddings --disable-llama-qk-remap
+```
+
+### Qwen2.5-Coder-14B-Instruct
+
+```
+python -m scripts.convert_safetensors_decoder_model_to_pkl --quantization_type int8 --base_model_dir original_models/Qwen2.5-Coder-14B-Instruct --output_model_dir converted_models/Qwen2.5-Coder-14B-Instruct --num-chunks 8 --quantize-embeddings
 ```
 
 ## Running models

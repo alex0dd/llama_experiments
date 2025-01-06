@@ -398,8 +398,9 @@ class Transformer:
         )
 
         self.precision = self.conversion_config.get("precision", "default")
+        self.precision_embeddings = self.conversion_config.get("precision_embeddings", "default")
         self.linear_fn = linears[self.precision]
-        self.embedding_fn = embeddings[self.precision]
+        self.embedding_fn = embeddings[self.precision_embeddings]
         if "gemma2" in self.model_type:
             self.transformer_block_fns = [
                 WeightlessTransformerBlock(

@@ -150,10 +150,10 @@ def parse_all_args():
              "in multiple .pkl files for on-demand loading."
     )
     arg_parser.add_argument(
-        "--quantize_embeddings",
+        "--quantize-embeddings",
         type=bool,
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="If specified, input embeddings will be quantized.",
     )
     arg_parser.add_argument(
@@ -305,6 +305,9 @@ with open(config_fpath, "r") as file:
 
 data["conversion_config"] = {
     "precision": "default" if not quantization_type else quantization_type,
+    "precision_embeddings": quantization_type 
+        if quantize_embeddings and quantization_type 
+        else "default",
     "chunking_info": {
         "num_chunks": num_chunks,
         "chunk_size": chunk_size,
